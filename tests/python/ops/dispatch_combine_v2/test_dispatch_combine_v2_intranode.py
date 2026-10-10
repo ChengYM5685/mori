@@ -90,8 +90,9 @@ def _assert_all_pass(rc, out):
 
 _skip_fp4 = pytest.mark.skipif(not _IS_GFX950, reason="fp4 is gfx950-only")
 
-# This is a functional test, not a perf test: hidden_dim is fixed at 7168 and the
-# token-count "shape" is covered cheaply by SWEEP inside a single torchrun launch.
+# This is a functional test, not a perf test: hidden_dim is fixed at 7168 (bar the
+# small-hidden cases) and the token-count "shape" is covered cheaply by SWEEP
+# inside a single torchrun launch.
 # The parametrized matrix covers the functional axes (dtype, combine, quant, scale
 # forwarding, topk, and the feature paths).
 
@@ -155,6 +156,12 @@ def _cases():
     yield pytest.param(
         {"DTYPE": "bf16", "COMBINE": "gather", "STDMOE": 1}, id="bf16-stdmoe"
     )
+    # small hidden at few tokens: more combine warps per token than i32 units
+    for c in ("gather", "scatter"):
+        yield pytest.param(
+            {"DTYPE": "bf16", "COMBINE": c, "HIDDEN": 256, "SWEEP": "1,2,3,4,5"},
+            id=f"bf16-{c}-hidden256",
+        )
 
 
 @pytest.mark.parametrize("env", list(_cases()))

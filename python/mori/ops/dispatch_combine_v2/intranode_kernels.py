@@ -772,6 +772,10 @@ def make_combine(
             eff = arith.select(
                 rem < units_per_warp, rem, units_per_warp
             )  # i32 units this warp
+            # With more warps per token than i32 units (small hidden, few tokens),
+            # trailing warps start past the row; a negative eff would floor
+            # main_end below zero and send the tail loop to negative offsets.
+            eff = arith.select(rem < arith.constant(0), arith.constant(0), eff)
             out_base = tok_id * out_n_i32
 
             # Nested fn: closure over expert_bases/valids (lists can't be loop-carried).
