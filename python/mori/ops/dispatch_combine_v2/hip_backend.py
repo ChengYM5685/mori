@@ -870,11 +870,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         taken, like every other gate here."""
         bad = []
         # Shares the internode kernels' dtype and feature range -- it reduces the
-        # same way and stages through the same slots.
+        # same way and stages through the same slots. The dispatch leg also takes
+        # fp4: AsyncLL only moves bytes, so packed e2m1 rides a 1-byte container.
         for leg, leg_dtype in (
             ("dispatch", cfg.dispatch_dtype),
             ("combine", cfg.combine_dtype),
         ):
+            if leg == "dispatch" and cfg.is_fp4:
+                continue
             if leg_dtype not in self._INTERNODE_DTYPE:
                 bad.append(
                     f"{leg} dtype {leg_dtype} has no AsyncLL kernel "
@@ -1365,10 +1368,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def _asyncll_leg(group):
         return "dispatch" if group.startswith("dispatch") else "combine"
 
-    def _asyncll_request(self, cfg, dtype_tag, block_num, warp_per_block):
+    def _asyncll_request(
+        self, cfg, dtype_tag, block_num, warp_per_block, hidden_dim=None
+    ):
         request = self._internode_request(
             cfg, dtype_tag, block_num, warp_per_block, rdma_block_num=0
         )
+        if hidden_dim is not None:
+            request["hiddenDim"] = hidden_dim
         # The AsyncLL specs derive every grid themselves -- the copy passes from
         # mpCount, the transfer passes from worldSize -- so the device's CU count
         # has to reach them. The internode request never carries it because its
@@ -1380,9 +1387,20 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def _build_asyncll_kernels(self, cfg) -> KernelSet:
         from mori.jit.v2 import plan_api
 
+        # fp4 dispatch: the kernels only size and copy the payload, so it travels as
+        # hidden_dim // 2 one-byte elements (2 e2m1 per byte), the same row the
+        # recv_tokens view and token_nbytes describe. Combine stays full width.
         leg_dtype = {
-            "dispatch": self._INTERNODE_DTYPE[cfg.dispatch_dtype],
+            "dispatch": (
+                self._INTERNODE_DTYPE[torch.float8_e4m3fn]
+                if cfg.is_fp4
+                else self._INTERNODE_DTYPE[cfg.dispatch_dtype]
+            ),
             "combine": self._INTERNODE_DTYPE[cfg.combine_dtype],
+        }
+        leg_hidden = {
+            "dispatch": cfg.hidden_dim // 2 if cfg.is_fp4 else cfg.hidden_dim,
+            "combine": cfg.hidden_dim,
         }
         block_num = cfg.dispatch_block_num
         warp_per_block = cfg.warp_num_per_block
@@ -1397,8 +1415,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         sequences = self._asyncll_seq(cfg, self._asyncll_mode)
         for group, names in sequences.items():
             for name in names:
+                leg = self._asyncll_leg(group)
                 request = self._asyncll_request(
-                    cfg, leg_dtype[self._asyncll_leg(group)], block_num, warp_per_block
+                    cfg,
+                    leg_dtype[leg],
+                    block_num,
+                    warp_per_block,
+                    hidden_dim=leg_hidden[leg],
                 )
                 plan = cb.EP_ASYNCLL_PLANS[name](**request)
                 # Neither varies for AsyncLL: there is one geometry per op, and
