@@ -27,7 +27,8 @@ communicator, like its neighbours here.
     MORI_ENABLE_SDMA=1 torchrun --standalone --nproc_per_node=8 test_asyncll.py
 
 Env: HIDDEN, TOPK, EPR, M, LOOP (at least 3), SHAPES to override the swept list,
-TRANSPORT=sdma|lsa, GRAPH_REPLAYS (default 32; 0 skips the graph regression) and
+TRANSPORT=sdma|lsa, FP4 (default 1; 0 skips the fp4 dispatch run),
+GRAPH_REPLAYS (default 32; 0 skips the graph regression) and
 BACK_TO_BACK (rounds with no host sync, default 6; 0 skips).
 
 What is checked, and why these and not more:
@@ -310,6 +311,98 @@ def run_shape(d, comm, hidden, topk, epr, m, loops):
                         flush=True,
                     )
                     failures += 1
+    return failures
+
+
+def run_fp4_dispatch(d, comm, hidden, topk, epr, m, loops):
+    """fp4x2 dispatch with group-32 e8m0 scales and a bf16 combine, the layout an
+    FP4-weight MoE consumes. Dispatch only copies bytes, so tokens and scales must
+    arrive bit-exact; the combine round trip checks the bf16 leg still lines up."""
+    rank, world = d.rank, d.world
+    dev = torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
+    scale_bytes = hidden // 32
+    cfg = EpDispatchCombineConfig(
+        rank=rank,
+        world_size=world,
+        hidden_dim=hidden,
+        max_num_inp_token_per_rank=m,
+        num_experts_per_rank=epr,
+        num_experts_per_token=topk,
+        data_type=torch.bfloat16,
+        dispatch_data_type=torch.float4_e2m1fn_x2,
+        combine_data_type=torch.bfloat16,
+        scale_dim=scale_bytes,
+        scale_type_size=1,
+        kernel_backend="hip",
+        async_ll=True,
+        async_ll_transport=os.environ.get("TRANSPORT", "sdma"),
+    )
+    failures = 0
+    with EpDispatchCombineOp(cfg, comm) as op:
+        for it in range(loops):
+            counts = [((r + it) * 7) % (m + 1) for r in range(world)]
+            n = counts[rank]
+            gen = torch.Generator(device=dev).manual_seed(4321 + rank * 17 + it)
+            tok = torch.randint(
+                0, 256, (m, hidden // 2), generator=gen, device=dev, dtype=torch.uint8
+            )
+            sc = torch.randint(
+                0, 256, (m, scale_bytes), generator=gen, device=dev, dtype=torch.uint8
+            )
+            w = torch.rand(m, topk, generator=gen, device=dev, dtype=torch.float32)
+            idx = _routing(rank, world, m, topk, epr, dev, gen, n)
+            xin = tok[:n].view(torch.float4_e2m1fn_x2)
+            # Token bytes and scale bytes side by side, so one exact comparison
+            # covers both.
+            packed = torch.cat([tok[:n], sc[:n]], 1)
+            gathered = _gather_inputs(packed, idx, w[:n], world)
+            idx_cpu = gathered[rank][1]
+            for split in (True, False):
+                api = "split" if split else "ordinary"
+                tag = f"fp4 h={hidden} k={topk} it={it} api={api}"
+                dispatch = op.dispatch_send if split else op.dispatch
+                out, out_weights, out_scales, out_indices, total, routing = dispatch(
+                    xin, w[:n], sc[:n], idx, return_routing=True
+                )
+                if split:
+                    op.dispatch_recv()
+                torch.cuda.synchronize()
+                dist.barrier()
+                recv_scales = out_scales.view(torch.uint8)[:, :scale_bytes]
+                received = torch.cat([out.view(torch.uint8), recv_scales], 1)
+                recv, bad = _check_dispatch(
+                    d,
+                    received,
+                    out_indices,
+                    out_weights,
+                    total,
+                    routing.disp_tok_id_to_src_tok_id_local,
+                    gathered,
+                    m,
+                    epr,
+                    tag,
+                )
+                failures += bad
+
+                ones = torch.ones(recv, hidden, dtype=torch.bfloat16, device=dev)
+                combine = op.combine_send if split else op.combine
+                cout, _ = combine(ones, None, idx, routing=routing)
+                if split:
+                    op.combine_recv()
+                torch.cuda.synchronize()
+                dist.barrier()
+                if n:
+                    uniq = torch.tensor(
+                        [len({int(e) // epr for e in row.tolist()}) for row in idx_cpu],
+                        dtype=torch.float32,
+                    )
+                    got = cout[:n].float().cpu()
+                    if not torch.equal(got, uniq[:, None].expand_as(got)):
+                        print(
+                            f"[rank {rank}] {tag}: combine round trip mismatch",
+                            flush=True,
+                        )
+                        failures += 1
     return failures
 
 
@@ -737,6 +830,18 @@ def main():
                 f"# asyncll hidden={hidden} topk={topk} epr={epr} m={m}: done",
                 flush=True,
             )
+
+    if os.environ.get("FP4", "1") != "0":
+        for hidden, topk, epr, m in ((7168, 8, 32, 128), (4096, 6, 48, 128)):
+            uid = Communicator.get_unique_id() if d.rank == 0 else None
+            uid = d.bcast_uid(uid)
+            win_bytes = d.world * hidden * m * 2 * 4 + (1 << 24)
+            with Communicator.init(
+                d.world, d.rank, uid, per_rank_vmm=6 * win_bytes + (1 << 28)
+            ) as comm:
+                failures += run_fp4_dispatch(d, comm, hidden, topk, epr, m, loops)
+            if d.rank == 0:
+                print(f"# asyncll fp4 hidden={hidden} topk={topk}: done", flush=True)
 
     if graph_replays:
         for empty_all in (False, True):

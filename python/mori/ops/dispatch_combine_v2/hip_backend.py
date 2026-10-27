@@ -871,14 +871,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         bad = []
         # Shares the internode kernels' dtype and feature range -- it reduces the
         # same way and stages through the same slots.
-        for leg, leg_dtype in (
-            ("dispatch", cfg.dispatch_dtype),
-            ("combine", cfg.combine_dtype),
+        for leg, leg_dtype, table in (
+            ("dispatch", cfg.dispatch_dtype, self._ASYNCLL_DISPATCH_DTYPE),
+            ("combine", cfg.combine_dtype, self._INTERNODE_DTYPE),
         ):
-            if leg_dtype not in self._INTERNODE_DTYPE:
+            if leg_dtype not in table:
                 bad.append(
                     f"{leg} dtype {leg_dtype} has no AsyncLL kernel "
-                    f"(have {', '.join(self._INTERNODE_DTYPE.values())})"
+                    f"(have {', '.join(table.values())})"
                 )
         if cfg.is_scatter:
             bad.append("combine_mode='scatter' (the AsyncLL combine gathers)")
@@ -987,6 +987,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         torch.float8_e4m3fnuz: "fp8_fnuz",
         torch.float8_e4m3fn: "fp8_ocp",
     }
+
+    # AsyncLL's dispatch passes only copy bytes, so they also move fp4x2; the
+    # combine passes reduce in the element type and stay on _INTERNODE_DTYPE.
+    _ASYNCLL_DISPATCH_DTYPE = {**_INTERNODE_DTYPE, torch.float4_e2m1fn_x2: "fp4"}
 
     # Which leg each pass belongs to. The two legs are separate Plans and carry
     # DIFFERENT element types, exactly as the intranode path does: the kernel's
@@ -1365,10 +1369,18 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def _asyncll_leg(group):
         return "dispatch" if group.startswith("dispatch") else "combine"
 
-    def _asyncll_request(self, cfg, dtype_tag, block_num, warp_per_block):
+    def _asyncll_request(self, cfg, leg, block_num, warp_per_block):
+        if leg == "dispatch":
+            dtype_tag = self._ASYNCLL_DISPATCH_DTYPE[cfg.dispatch_dtype]
+        else:
+            dtype_tag = self._INTERNODE_DTYPE[cfg.combine_dtype]
         request = self._internode_request(
             cfg, dtype_tag, block_num, warp_per_block, rdma_block_num=0
         )
+        if leg == "dispatch" and cfg.is_fp4:
+            # hiddenDim counts elements of the leg's dtype; an fp4x2 element is
+            # two e2m1, as on the intranode path.
+            request["hiddenDim"] = cfg.hidden_dim // 2
         # The AsyncLL specs derive every grid themselves -- the copy passes from
         # mpCount, the transfer passes from worldSize -- so the device's CU count
         # has to reach them. The internode request never carries it because its
@@ -1380,10 +1392,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     def _build_asyncll_kernels(self, cfg) -> KernelSet:
         from mori.jit.v2 import plan_api
 
-        leg_dtype = {
-            "dispatch": self._INTERNODE_DTYPE[cfg.dispatch_dtype],
-            "combine": self._INTERNODE_DTYPE[cfg.combine_dtype],
-        }
         block_num = cfg.dispatch_block_num
         warp_per_block = cfg.warp_num_per_block
 
@@ -1398,7 +1406,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         for group, names in sequences.items():
             for name in names:
                 request = self._asyncll_request(
-                    cfg, leg_dtype[self._asyncll_leg(group)], block_num, warp_per_block
+                    cfg, self._asyncll_leg(group), block_num, warp_per_block
                 )
                 plan = cb.EP_ASYNCLL_PLANS[name](**request)
                 # Neither varies for AsyncLL: there is one geometry per op, and
