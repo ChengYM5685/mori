@@ -182,6 +182,29 @@ payload per dtype, `hidden*2` for bf16). Indicative bf16 numbers on **MI308X
 
 Cross-impl (v2 vs mori v1) latency tables for fp8/fp4 are in PR ROCm/mori#448.
 
+## Split native dispatch (FlyDSL)
+
+The FlyDSL intranode op also splits its ordinary dispatch (capability
+`split_dispatch`), without AsyncLL and without a second stream:
+
+```python
+out, w, s, idx, total, routing = op.dispatch_send(x, w, s, idx, return_routing=True)
+shared = shared_experts(h)  # same stream: runs while peers finish sending
+op.dispatch_recv()          # waits for every peer's count; now `out`/`total` are valid
+y, _ = op.combine(expert(out), routing=routing)
+```
+
+`dispatch_send` is the fused kernel's scatter and per-peer count signal; the
+`dispatch_recv` kernel (one wavefront) waits for every source's count, fills
+`total_recv` and resets the slot allocator. What the seam can hide is that wait,
+i.e. the skew between ranks. Replay (`routing=`) works on the send half too;
+`snapshot=` does not exist there. Every send must be followed by its recv before
+the next dispatch, combine or `local_expert_count`; the op refuses anything else
+on the host. Fused and split ranks interoperate, and the hip backend's native
+kernels do not split (no `split_dispatch`), so a caller probes the capability.
+`tests/python/ops/dispatch_combine_v2/test_native_split.py` checks it against
+the fused kernel.
+
 ## Perf (AsyncLL)
 
 AsyncLL (`async_ll=True`) splits each phase into a send half and a recv half, so
