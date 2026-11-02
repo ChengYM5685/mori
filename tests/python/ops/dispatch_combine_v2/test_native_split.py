@@ -394,7 +394,7 @@ def run_mode(d, comm, name, loops):
                 # Both replays start from a zeroed arena, so rows past the count
                 # agree and a split that wrote nothing cannot pass.
                 for t in views:
-                    t.zero_()
+                    t.view(torch.uint8).zero_()
                 lockstep()
                 if api == "fused":
                     ret = op.dispatch(x2, w2, s2, idx, routing=handle)
