@@ -33,6 +33,7 @@ from mori.tensor_utils import from_gpu_ptr
 from .intranode_kernels import (
     xdb_flag_slots,
     make_dispatch,
+    make_dispatch_recv,
     make_combine,
     make_combine_scatter,
     make_convert_dispatch_output,
@@ -237,6 +238,10 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             for (b, w) in dispatch_specs
         }
         self._dispatch_replay_variants_raw = {}  # lazily compiled per (block, warp)
+        # Split dispatch: send halves per (block, warp), compiled lazily like the
+        # replay ones (keyed (block, warp, replay)), and one recv for all of them.
+        self._dispatch_send_variants_raw = {}
+        self._dispatch_recv_raw = None
         if cfg.is_scatter:
             self._combine_variants = {
                 (b, w): make_combine_scatter(
@@ -344,6 +349,18 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
             dispatch_replay={
                 k: self._wrap_dispatch(k, replay=True) for k in self._dispatch_variants
             },
+            # The native dispatch split in two, so the caller can run its own work
+            # (e.g. shared experts) between the send and the wait for the peers'
+            # counts. Lazily compiled like the replay variants.
+            dispatch_send={
+                k: self._wrap_dispatch(k, replay=False, send=True)
+                for k in self._dispatch_variants
+            },
+            dispatch_replay_send={
+                k: self._wrap_dispatch(k, replay=True, send=True)
+                for k in self._dispatch_variants
+            },
+            dispatch_recv={k: self._run_dispatch_recv for k in self._dispatch_variants},
             # FlyDSL stages combine's input on the host (see combine()).
             stages_in_kernel=False,
             capabilities=frozenset(
@@ -357,6 +374,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
                     "local_expert_count",
                     "asymmetric_dtype",
                     "recv_cap",
+                    "split_dispatch",
                 }
             ),
         )
@@ -399,6 +417,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
         buckets. Returns (packed_x, packed_count, packed_src); GEMM overwrites
         packed_x in place."""
         assert self.cfg.enable_std_moe, "op built without enable_std_moe"
+        self._check_dispatch_received("convert_dispatch_output")
         self.packed_count.zero_()
         self.slot_map.fill_(-1)
         arena = self.arena
@@ -468,15 +487,27 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
 
     # -- kernel adapters: FlyDSL's positional convention -> the base's named one --
 
-    def _wrap_dispatch(self, spec, *, replay):
+    def _wrap_dispatch(self, spec, *, replay, send=False):
         """One dispatch variant, callable the way ep_backend expects.
 
         Everything the base does not know about -- the window handle, the
-        counters, the barrier, rank, the stream -- is captured here.
+        counters, the barrier, rank, the stream -- is captured here. send=True
+        is the send half of the split dispatch (see _run_dispatch_recv).
         """
 
         def run(*, input, indices, weights, scales, dest_map, num_tokens):
-            if replay:
+            if send:
+                key = (spec[0], spec[1], replay)
+                kern = self._dispatch_send_variants_raw.get(key)
+                if kern is None:
+                    kern = self._dispatch_send_variants_raw[key] = make_dispatch(
+                        replay=replay,
+                        split_send=True,
+                        block_num=spec[0],
+                        warp_num_per_block=spec[1],
+                        **self._dispatch_kwargs,
+                    )
+            elif replay:
                 kern = self._dispatch_replay_variants_raw.get(spec)
                 if kern is None:
                     kern = self._dispatch_replay_variants_raw[spec] = make_dispatch(
@@ -508,6 +539,33 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
 
         return run
 
+    def _run_dispatch_recv(self, *, input=None, dest_map=None, num_tokens=0):
+        """The recv half of the split dispatch. It does not depend on the send's
+        (block, warp), replay or token count, so every spec maps here."""
+        kern = self._dispatch_recv_raw
+        if kern is None:
+            kern = self._dispatch_recv_raw = make_dispatch_recv(
+                npes=self.cfg.world_size,
+                off_tok_off=self.arena.offset("tok_off"),
+                off_recv_num=self.arena.offset("recv_num"),
+            )
+        kern(
+            self.arena.handle,
+            self.total_recv.data_ptr(),
+            self.cfg.rank,
+            fx.Stream(torch.cuda.current_stream()),
+        )
+
+    def _check_dispatch_received(self, what):
+        """total_recv and the arena's recv rows are this round's only after the
+        split dispatch's recv half; refuse a reader that would see the previous
+        round's instead."""
+        if self._asyncll_state == "sent":
+            raise RuntimeError(
+                f"{what}() reads the dispatch result, but dispatch_send has not "
+                "been followed by dispatch_recv yet"
+            )
+
     def _wrap_combine(self, spec):
         # want_weights is accepted and ignored: the FlyDSL combine kernels take
         # out_weights unconditionally with no null gate, so the fold always runs.
@@ -531,6 +589,7 @@ class EpDispatchCombineOpFlyDSL(EpDispatchCombineOp, backend="flydsl"):
     def local_expert_count(self):
         """[num_experts_per_rank] i32: recv tokens per local expert. Call after
         dispatch."""
+        self._check_dispatch_received("local_expert_count")
         self._local_expert_count_buf.zero_()
         stream = fx.Stream(torch.cuda.current_stream())
         self._local_expert_count(

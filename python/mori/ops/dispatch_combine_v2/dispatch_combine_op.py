@@ -655,12 +655,15 @@ class KernelSet:
     # Replay-routing dispatch. None = this backend has no replay.
     dispatch_replay: dict[tuple[int, int], Callable] | None = None
 
-    # The AsyncLL split. Each is the same (block_num, warp_num) -> callable shape
-    # as `dispatch`, but launching only half the pass sequence, so the caller can
-    # put its own work between the two. None = this backend runs send and recv in
-    # one launch and has no seam to expose.
+    # The send/recv split (AsyncLL, and the FlyDSL native dispatch). Each is the
+    # same (block_num, warp_num) -> callable shape as `dispatch`, but launching
+    # only half the pass sequence, so the caller can put its own work between the
+    # two. None = this backend runs send and recv in one launch and has no seam to
+    # expose.
     dispatch_send: dict[tuple[int, int], Callable] | None = None
     dispatch_recv: dict[tuple[int, int], Callable] | None = None
+    # The send half of a replay dispatch; its recv half is dispatch_recv.
+    dispatch_replay_send: dict[tuple[int, int], Callable] | None = None
     combine_send: dict[tuple[int, int], Callable] | None = None
     combine_recv: dict[tuple[int, int], Callable] | None = None
 
@@ -1108,7 +1111,11 @@ class EpDispatchCombineOp:
 
         recv_views = None
         if routing is not None:
-            table = self._kernels.dispatch_replay
+            table = (
+                self._kernels.dispatch_replay
+                if kernels is self._kernels.dispatch
+                else self._kernels.dispatch_replay_send
+            )
             if table is None:
                 raise NotImplementedError(
                     f"the {self.backend_name} backend has no routing replay"
@@ -1260,6 +1267,11 @@ class EpDispatchCombineOp:
     # The send half returns the same tuple dispatch() does, but the output buffers
     # are NOT populated until the matching recv call has run. Reading them in the
     # seam reads the previous round.
+    #
+    # The FlyDSL native dispatch splits the same way (capability
+    # "split_dispatch"): its send half is the scatter and the per-peer count
+    # signal, its recv half the wait for every peer's count. Combine stays one
+    # call there.
 
     # The AsyncLL protocol's call order, as a state machine. What each call is
     # allowed to see, and what it leaves behind:
@@ -1298,6 +1310,17 @@ class EpDispatchCombineOp:
         "combine_send": ("dispatched", "combining"),
         "combine_recv": ("combining", "idle"),
     }
+    # The native split (capability "split_dispatch") couples only its two halves:
+    # the send leaves every peer's count in this rank's recv_num and its slot
+    # allocator advanced, and only the recv clears them. Anything else launched in
+    # between -- another dispatch, a combine -- would find them set. Off the
+    # split, the native calls stay free of each other as before.
+    _SPLIT_ORDER = {
+        "dispatch": ("idle", "idle"),
+        "dispatch_send": ("idle", "sent"),
+        "dispatch_recv": ("sent", "idle"),
+        "combine": ("idle", "idle"),
+    }
     _asyncll_state = "idle"
 
     def _asyncll_check_weight_fold(self, weights):
@@ -1327,10 +1350,25 @@ class EpDispatchCombineOp:
         launch that never happened, and the caller's next, correct call was
         refused as out of order. So the check is up front and the advance is on
         the way out: an exception from the body leaves the state where it was.
-        No-op off the AsyncLL family.
+        Off the AsyncLL family only the native split's pairing is checked.
         """
         if not getattr(self.cfg, "async_ll", False):
+            step = self._SPLIT_ORDER.get(call)
+            if step is None:
+                yield
+                return
+            want, nxt = step
+            if self._asyncll_state != want:
+                raise RuntimeError(
+                    f"{call}() is not valid here: a split dispatch is "
+                    f"{self._asyncll_state!r} and this call needs {want!r}. Every "
+                    "dispatch_send must be followed by its dispatch_recv before "
+                    "the next dispatch or combine; skipping it leaves the peers' "
+                    "counts unread and every rank waits forever. Call reset() if "
+                    "you need to start over."
+                )
             yield
+            self._asyncll_state = nxt
             return
         want, nxt = self._ASYNCLL_ORDER[call]
         if self._asyncll_state != want:
@@ -1351,8 +1389,9 @@ class EpDispatchCombineOp:
         if table is None:
             raise NotImplementedError(
                 f"the {self.backend_name} backend has no {which}: it runs send and "
-                "recv in one launch. Build the op with async_ll=True (hip backend) "
-                "to get the split."
+                "recv in one launch. Build the op with async_ll=True (hip backend), "
+                "or use the flydsl backend (capability 'split_dispatch', dispatch "
+                "only), to get the split."
             )
         return table
 
@@ -1362,7 +1401,10 @@ class EpDispatchCombineOp:
         """Enqueue the send half of a dispatch and return immediately.
 
         Same arguments and same return as :meth:`dispatch`. The returned views are
-        only valid after :meth:`dispatch_recv`.
+        only valid after :meth:`dispatch_recv`; that includes total_recv, so
+        anything that reads it (local_expert_count, the routing handle's count,
+        combine) must come after the recv as well. Every send must be followed by
+        its recv before the next dispatch or combine on this op.
         """
         with self._asyncll_call("dispatch_send"):
             return self._dispatch_impl(
@@ -1434,6 +1476,10 @@ class EpDispatchCombineOp:
         # call-order error tells a caller to use: the counts and the epoch it
         # zeroes below are exactly the state that order was protecting.
         self._asyncll_state = "idle"
+        self._async_pending_dispatch_tokens = None
+        self._async_pending_dispatch_input = None
+        self._async_pending_dispatch_map = None
+        self._async_pending_combine = None
         self.arena.zero()
         self.token_dest_map.fill_(-1)
         self.routing_dest_map.fill_(self._null_flat)

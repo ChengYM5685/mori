@@ -112,7 +112,11 @@ def make_dispatch(
     enable_signal=True,
     replay=False,
     fp4=False,
+    split_send=False,
 ):
+    # split_send=True builds the send half of a split dispatch: Phases 1-2 only,
+    # leaving Phase 3 (wait for every peer's count, then total_recv) to
+    # make_dispatch_recv, so the caller can run its own work between the two.
     # fp4 (e2m1) packs 2 values per byte, so a token is hidden_dim/2 bytes; dispatch
     # is a pure byte mover (no fp4 decode), matching mori v1's plain-fp4 path.
     nbytes = hidden_dim // 2 if fp4 else hidden_dim * hidden_elem_size
@@ -312,14 +316,16 @@ def make_dispatch(
             # only global warp 0 touches it — lane 0 zeros it here, all lanes
             # accumulate into it in Phase 3. The waitcnt_all + grid barrier below
             # drains this store before the Phase-3 adds; total_recv is local, so
-            # no release fence / L2 writeback is needed.
-            if global_warp_id == 0:
-                if lane == 0:
-                    buffer_store(
-                        arith.constant(0),
-                        create_buffer_resource_from_addr(addr_total_recv),
-                        0,
-                    )
+            # no release fence / L2 writeback is needed. The split send leaves
+            # total_recv alone: its recv half resets and fills it.
+            if const_expr(not split_send):
+                if global_warp_id == 0:
+                    if lane == 0:
+                        buffer_store(
+                            arith.constant(0),
+                            create_buffer_resource_from_addr(addr_total_recv),
+                            0,
+                        )
 
             # ── Phase 2: grid barrier + per-peer count signal ──
             # s_barrier only syncs wavefronts; drain memory counters first so the
@@ -347,25 +353,34 @@ def make_dispatch(
                     P.store_i32_system(
                         recv_num_remote_addr, arith.constant(0), signal_value
                     )
+                    if const_expr(split_send):
+                        # Phase 3 clears it in the fused kernel; the split recv
+                        # never sees this rank's send counters, so clear it here,
+                        # right after the count it held has been published.
+                        buffer_store(arith.constant(0), rsrc_dest_ctr, dest_pe)
 
             # ── Phase 3: collect per-source counts into total_recv ──
-            for src_pe in range(lane, npes, WAVE):
-                if global_warp_id == 0:
-                    recv_num_src_addr = local_recv_num + fx.Int64(src_pe) * fx.Int64(4)
-                    signal_value = P.spin_until_gt_i32(recv_num_src_addr, 0)
-                    peer_recv_count = signal_value - 1
-                    P.store_i32_system(
-                        recv_num_src_addr, arith.constant(0), arith.constant(0)
-                    )
-                    P.atomic_add_global(fx.Int64(addr_total_recv), peer_recv_count)
-                    buffer_store(arith.constant(0), rsrc_dest_ctr, src_pe)
+            # The split send stops here; make_dispatch_recv runs this part.
+            if const_expr(not split_send):
+                for src_pe in range(lane, npes, WAVE):
+                    if global_warp_id == 0:
+                        src_off = fx.Int64(src_pe) * fx.Int64(4)
+                        recv_num_src_addr = local_recv_num + src_off
+                        signal_value = P.spin_until_gt_i32(recv_num_src_addr, 0)
+                        peer_recv_count = signal_value - 1
+                        P.store_i32_system(
+                            recv_num_src_addr, arith.constant(0), arith.constant(0)
+                        )
+                        P.atomic_add_global(fx.Int64(addr_total_recv), peer_recv_count)
+                        buffer_store(arith.constant(0), rsrc_dest_ctr, src_pe)
 
-            if global_warp_id == 0:
-                if lane == 0:
-                    local_tok_off = fx.Int64(window.lsa_ptr(my_lsa_rank, off_tok_off))
-                    P.store_i32_system(
-                        local_tok_off, arith.constant(0), arith.constant(0)
-                    )
+                if global_warp_id == 0:
+                    if lane == 0:
+                        tok_off_addr = window.lsa_ptr(my_lsa_rank, off_tok_off)
+                        local_tok_off = fx.Int64(tok_off_addr)
+                        P.store_i32_system(
+                            local_tok_off, arith.constant(0), arith.constant(0)
+                        )
 
     @flyc.jit
     def run(
@@ -398,6 +413,56 @@ def make_dispatch(
             grid=(block_num, 1, 1),
             block=[warp_num_per_block * WAVE, 1, 1],
             stream=stream,
+        )
+
+    return run
+
+
+def make_dispatch_recv(*, npes, off_tok_off, off_recv_num):
+    """Recv half of a split dispatch: Phase 3 of make_dispatch on its own.
+
+    Pairs with make_dispatch(split_send=True), whatever its (block, warp) or
+    replay variant. One wavefront: wait until every source PE has published its
+    count (recv_num[src] = count + 1), clear the slots for the next round, sum
+    the counts into total_recv and reset this rank's slot allocator. Nothing here
+    depends on the token count, so one compiled kernel serves every call and a
+    CUDA graph can capture it once.
+    """
+
+    @flyc.kernel(known_block_size=[WAVE, 1, 1])
+    def ep_dispatch_recv(arena: Int64, addr_total_recv: Int64, my_lsa_rank: Int32):
+        lane = fx.thread_idx.x & LANE_MASK  # the block is one wavefront
+        window = cco.Window(arena)
+        # total_recv is zeroed here rather than by the send half, so between the
+        # two it still holds the previous round's count instead of a partial sum.
+        if lane == 0:
+            buffer_store(
+                arith.constant(0), create_buffer_resource_from_addr(addr_total_recv), 0
+            )
+        P.waitcnt_all()
+
+        local_recv_num = fx.Int64(window.lsa_ptr(my_lsa_rank, off_recv_num))
+        for src_pe in range(lane, npes, WAVE):
+            recv_num_src_addr = local_recv_num + fx.Int64(src_pe) * fx.Int64(4)
+            signal_value = P.spin_until_gt_i32(recv_num_src_addr, 0)
+            peer_recv_count = signal_value - 1
+            P.store_i32_system(recv_num_src_addr, arith.constant(0), arith.constant(0))
+            P.atomic_add_global(fx.Int64(addr_total_recv), peer_recv_count)
+
+        # Every peer has published its count, so none still allocates slots here.
+        if lane == 0:
+            local_tok_off = fx.Int64(window.lsa_ptr(my_lsa_rank, off_tok_off))
+            P.store_i32_system(local_tok_off, arith.constant(0), arith.constant(0))
+
+    @flyc.jit
+    def run(
+        arena: Int64,
+        addr_total_recv: Int64,
+        my_lsa_rank: Int32,
+        stream=fx.Stream(None),
+    ):
+        ep_dispatch_recv(arena, addr_total_recv, my_lsa_rank).launch(
+            grid=(1, 1, 1), block=[WAVE, 1, 1], stream=stream
         )
 
     return run
