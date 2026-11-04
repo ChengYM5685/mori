@@ -223,3 +223,28 @@ EP_ASYNCLL_PLANS = {
         "combine_recvtransfer_lsa",
     )
 }
+
+# The zero-copy passes (EpDispatchCombineConfig.async_ll_zero_copy), made on first
+# use so a host library built without them still serves every other op.
+_ASYNCLL_ZC_PASSES = frozenset(
+    {
+        "dispatch_sendcopy_zc",
+        "dispatch_sendtransfer_zc",
+        "dispatch_recvfinalize_zc",
+        "combine_sendcopy_zc",
+        "combine_sendtransfer_zc",
+        "combine_recvcopy_zc",
+    }
+)
+_asyncll_zc_plans = {}
+
+
+def asyncll_plan(name):
+    """The Plan class of AsyncLL pass `name`."""
+    if name not in _ASYNCLL_ZC_PASSES:
+        return EP_ASYNCLL_PLANS[name]
+    plan = _asyncll_zc_plans.get(name)
+    if plan is None:
+        plan = make_plan(f"ep_asyncll_{name}", enums=_INTERNODE_ENUMS)
+        _asyncll_zc_plans[name] = plan
+    return plan

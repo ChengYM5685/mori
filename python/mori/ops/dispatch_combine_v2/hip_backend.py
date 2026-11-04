@@ -60,7 +60,7 @@ from mori.tensor_utils import from_gpu_ptr
 
 from . import ep_plans as cb
 from .dispatch_combine_op import _PUSH_QUANT_TYPES, EpDispatchCombineOp, KernelSet
-from .internode_regions import asyncll_regions, internode_regions
+from .internode_regions import asyncll_regions, asyncll_zc_layout, internode_regions
 from .symm_arena import SymmArena
 
 # C++ offset-argument stem -> arena region name. The C++ side names the offsets
@@ -420,6 +420,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # them per call -- torch.as_tensor + view showed up in the host profile at
         # ~27us a round, on a path where the host already paces the GPU.
         self._views = {}
+        # This round's zero-copy stride, 0 for the compact layout (see
+        # _set_zero_copy_stride). Combine and the views follow the last dispatch.
+        self._zc_stride = 0
         # gfx125x routes to the TDM kernel, which needs a superset arena (plan A).
         _arch = getattr(torch.cuda.get_device_properties(dev), "gcnArchName", "") or ""
         self._arch = _arch.split(":")[0]
@@ -742,6 +745,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self.disp_receiver_idx_map = (
             torch.zeros(cfg.effective_max_recv, **i32) if cfg.async_ll else None
         )
+        # AsyncLL zero copy only: each source's rows this round, then sticky error
+        # bits (zero_copy_error_flags).
+        self.zc_seg_count = (
+            torch.zeros(world_size + 1, **i32) if cfg.async_ll_zero_copy else None
+        )
         self.total_recv = torch.zeros(1, **i32)
         self.dispatch_barrier = torch.zeros(world_size, dtype=torch.uint32, device=dev)
         self.combine_barrier = torch.zeros(world_size, dtype=torch.uint32, device=dev)
@@ -955,7 +963,36 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 "it and every AsyncLL transfer would be a no-op (or use "
                 "async_ll_transport='lsa', which needs no engine)"
             )
+        if cfg.async_ll_zero_copy:
+            bad.extend(self._asyncll_zero_copy_unsupported(cfg))
         return tuple(bad)
+
+    def _asyncll_zero_copy_unsupported(self, cfg) -> list[str]:
+        bad = []
+        if cfg.async_ll_transport != "sdma" or cfg.nodes > 1:
+            bad.append(
+                "async_ll_zero_copy needs async_ll_transport='sdma' on one node: its "
+                "transfer posts one SDMA packet per field to each peer"
+            )
+        if cfg.world_size < 2:
+            bad.append(
+                "async_ll_zero_copy needs world_size >= 2: an empty row points at "
+                "another rank's expert"
+            )
+        if (cfg.scale_dim * cfg.scale_type_size) % 4:
+            bad.append(
+                "async_ll_zero_copy needs a whole number of dwords per scale row"
+            )
+        try:
+            mode, _ = self._asyncll_options(cfg, self._arch)
+        except ValueError:
+            mode = 0  # reported when the kernels are built
+        if mode == 2:
+            bad.append(
+                "async_ll_zero_copy with MORI_ASYNCLL_FUSED_RECV=1: the zero-copy "
+                "receive keeps the separate RecvTransfer"
+            )
+        return bad
 
     def _unsupported(self, cfg) -> tuple[str, ...]:
         """Everything this backend cannot do, checked before anything is built."""
@@ -1163,6 +1200,15 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # embed a ccoDevComm by value, so the binding memcpys from host memory.
             devComm=self._dev_comm._dev_comm.host_ptr,
         )
+        if self.cfg.async_ll_zero_copy:
+            # Only bound on zero-copy ops, so an older host library serves the rest.
+            # An empty row points at the next rank's first expert, which the
+            # expert mask of this rank drops.
+            cfg = self.cfg
+            invalid = (cfg.rank + 1) % cfg.world_size * cfg.num_experts_per_rank
+            self._internode_static_cache.update(
+                zcSegCount=ptr(self.zc_seg_count), zcInvalidExpert=invalid
+            )
         return self._internode_static_cache
 
     def _internode_variants(self, phase):
@@ -1359,6 +1405,32 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         "dispatch_sendcopy_lsa",
     )
 
+    # Zero-copy rounds (async_ll_zero_copy, SDMA only): the expert reads the
+    # landing segments, so dispatch's RecvCopy becomes a finalize pass. Level 1
+    # copies the segmented expert output into the compact combine staging and
+    # keeps the rest of combine; level 2 sends it in place.
+    _ASYNCLL_ZC_SEQ = {
+        "dispatch_send": (
+            "dispatch_slotassign",
+            "dispatch_sendcopy_zc",
+            "dispatch_sendtransfer_zc",
+        ),
+        "dispatch_recv": ("dispatch_recvtransfer", "dispatch_recvfinalize_zc"),
+        "combine_send": ("combine_sendcopy_zc", "combine_sendtransfer"),
+        "combine_recv": ("combine_recvtransfer", "combine_recvcopy"),
+    }
+    _ASYNCLL_ZC_SEQ_IN_PLACE = {
+        "combine_send": ("combine_sendtransfer_zc",),
+        "combine_recv": ("combine_recvtransfer", "combine_recvcopy_zc"),
+    }
+
+    @classmethod
+    def _asyncll_zc_seq(cls, level):
+        seq = dict(cls._ASYNCLL_ZC_SEQ)
+        if level == 2:
+            seq.update(cls._ASYNCLL_ZC_SEQ_IN_PLACE)
+        return seq
+
     @staticmethod
     def _asyncll_options(cfg, arch):
         # Resolve once per op. Shared copy passes also serve LSA, so topology
@@ -1440,12 +1512,19 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # always assigned the count. Still parsed so existing settings validate.
         self._asyncll_mode, _ = self._asyncll_options(cfg, self._arch)
         sequences = self._asyncll_seq(cfg, self._asyncll_mode)
-        for group, names in sequences.items():
+        zc_sequences = (
+            self._asyncll_zc_seq(cfg.async_ll_zero_copy)
+            if cfg.async_ll_zero_copy
+            else {}
+        )
+        for group, names in [*sequences.items(), *zc_sequences.items()]:
             for name in names:
+                if name in plans_by_pass:
+                    continue
                 request = self._asyncll_request(
                     cfg, leg_dtype[self._asyncll_leg(group)], block_num, warp_per_block
                 )
-                plan = cb.EP_ASYNCLL_PLANS[name](**request)
+                plan = cb.asyncll_plan(name)(**request)
                 # Neither varies for AsyncLL: there is one geometry per op, and
                 # this backend has no replay path. Bound rather than passed so the
                 # value is written into the plan's struct once instead of per
@@ -1458,6 +1537,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             group: plan_api.make_launch_group([plans_by_pass[n] for n in names])
             for group, names in sequences.items()
         }
+        self._asyncll_groups_zc = {
+            group: plan_api.make_launch_group([plans_by_pass[n] for n in names])
+            for group, names in zc_sequences.items()
+        }
+        self._zc_layout = asyncll_zc_layout(cfg) if cfg.async_ll_zero_copy else None
 
         # Every spec the schedule can select maps to the SAME callable. AsyncLL
         # compiles one geometry -- its specs derive each pass's grid from mpCount
@@ -1503,6 +1587,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
         def run(*, input, num_tokens, dest_map, **kwargs):
             phase = "dispatch" if groups[0].startswith("dispatch") else "combine"
+            stride = self._zc_stride
+            if stride and "combine_send" in groups:
+                input = self._zc_combine_input(input, stride)
             if phase == "dispatch":
                 if groups[0] == "dispatch_recv":
                     # dispatch_recv() launches this half with only input/dest_map/
@@ -1564,11 +1651,59 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                     else 0
                 ),
             )
+            if self.cfg.async_ll_zero_copy:
+                args["zcStride"] = stride
+            table = self._asyncll_groups_zc if stride else self._asyncll_groups
             stream = _raw_stream(self._device_index)
             for group in groups:
-                self._asyncll_groups[group].launch(stream, **args)
+                table[group].launch(stream, **args)
 
         return run
+
+    def _set_zero_copy_stride(self, stride, num_tokens):
+        if not stride:
+            self._zc_stride = 0
+            return
+        cfg = self.cfg
+        if not cfg.async_ll_zero_copy:
+            raise ValueError(
+                "zero_copy_stride needs an op built with async_ll_zero_copy"
+            )
+        # The reverse map and the recv views are sized by the receive cap.
+        cap = cfg.effective_max_recv_per_rank
+        if not num_tokens <= stride <= cap:
+            raise ValueError(
+                f"zero_copy_stride={stride} must cover this rank's {num_tokens} "
+                f"tokens and stay within the per-source receive cap {cap}"
+            )
+        self._zc_stride = int(stride)
+
+    def _zc_combine_input(self, input, stride):
+        """The expert output a zero-copy combine sends: world_size * stride rows
+        in the dispatch's segment layout; level 2 sends from the arena view."""
+        rows = self.cfg.world_size * stride
+        if input.shape[0] != rows:
+            raise ValueError(
+                f"a zero-copy combine takes the segmented expert output: "
+                f"{rows} rows (world_size x stride {stride}), got {input.shape[0]}"
+            )
+        if self.cfg.async_ll_zero_copy == 2:
+            view = self.combine_in_view()
+            if input.data_ptr() != view.data_ptr():
+                view.copy_(input)
+            return view
+        return input.contiguous()
+
+    def zero_copy_error_flags(self, clear=False):
+        """Sticky error bits of zero-copy rounds, 0 when none: 1 = a stride below
+        this rank's rows for some peer (rows were dropped), 2 = a peer's round did
+        not use this rank's stride. Reads device memory, so it synchronizes."""
+        if self.zc_seg_count is None:
+            return 0
+        flags = int(self.zc_seg_count[-1].item())
+        if clear:
+            self.zc_seg_count[-1].zero_()
+        return flags
 
     def _build_internode_kernels(self, cfg) -> KernelSet:
         # One tag per leg, not one for the op: see _INTERNODE_LEG. Both keys are
@@ -1873,7 +2008,21 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             return self._ASYNCLL_VIEW_REGION.get(name, internode)
         return internode if self.cfg.is_internode else intranode
 
+    def _zc_view(self, key, region, offset, cols, dtype):
+        """Rows [0, world_size * stride) of a zero-copy field block."""
+        view = self._views.get(key)
+        if view is None:
+            rows = self.cfg.world_size * self.cfg.max_num_inp_token_per_rank
+            ptr = self.arena.local_ptr(region) + offset
+            view = from_gpu_ptr(ptr, (rows, cols), dtype)
+            self._views[key] = view
+        return view[: self.cfg.world_size * self._zc_stride]
+
     def recv_tokens(self):
+        if self._zc_stride:
+            offset, cols = self._zc_layout["hidden"], self.cfg.hidden_dim
+            dtype = self.cfg.dispatch_dtype
+            return self._zc_view("zc_tokens", "inter_dispatch_inp", offset, cols, dtype)
         view = self._views.get("recv_tokens")
         if view is not None:
             return view
@@ -1888,6 +2037,11 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return view
 
     def combine_in_view(self):
+        if self._zc_stride:
+            cols, dtype = self.cfg.hidden_dim, self.cfg.combine_dtype
+            return self._zc_view(
+                "zc_combine_in", "inter_dispatch_staging", 0, cols, dtype
+            )
         view = self._views.get("combine_in")
         if view is None:
             view = from_gpu_ptr(
@@ -1899,6 +2053,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return view
 
     def recv_weights(self):
+        if self._zc_stride:
+            offset, topk = self._zc_layout["weight"], self.cfg.num_experts_per_token
+            region = "inter_dispatch_inp"
+            return self._zc_view("zc_weights", region, offset, topk, torch.float32)
         view = self._views.get("recv_weights")
         if view is None:
             view = from_gpu_ptr(
@@ -1910,6 +2068,10 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return view
 
     def recv_indices(self):
+        if self._zc_stride:
+            offset, topk = self._zc_layout["index"], self.cfg.num_experts_per_token
+            region = "inter_dispatch_inp"
+            return self._zc_view("zc_indices", region, offset, topk, torch.int32)
         view = self._views.get("recv_indices")
         if view is None:
             view = from_gpu_ptr(
@@ -1929,12 +2091,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         path, packed on the internode one. Anything reading the region by pointer
         needs that pitch, not this shape.
         """
-        view = self._views.get("recv_scales")
-        if view is not None:
-            return view
         n_i32 = self._scale_i32(self.cfg)
         if not n_i32:
             return None
+        if self._zc_stride:
+            # Packed rows, a whole number of dwords (the zero-copy gate checks).
+            offset = self._zc_layout["scale"]
+            region = "inter_dispatch_inp"
+            return self._zc_view("zc_scales", region, offset, n_i32, torch.int32)
+        view = self._views.get("recv_scales")
+        if view is not None:
+            return view
         stride_i32 = self.scale_stride_bytes() // 4
         rows = from_gpu_ptr(
             self.arena.local_ptr(self._region("out_scales")),

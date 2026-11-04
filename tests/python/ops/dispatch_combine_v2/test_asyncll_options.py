@@ -27,6 +27,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
+from mori.ops.dispatch_combine_v2.internode_regions import (
+    asyncll_regions,
+    asyncll_zc_layout,
+)
 
 
 class AsyncLLOptionsTest(unittest.TestCase):
@@ -97,6 +101,65 @@ class AsyncLLOptionsTest(unittest.TestCase):
                 self.resolve({"MORI_ASYNCLL_EARLY_NOTIFY": "0", option: "1"})
         with self.assertRaises(ValueError):
             self.resolve({"MORI_ASYNCLL_EARLY_NOTIFY": "yes"})
+
+
+class AsyncLLZeroCopyTest(unittest.TestCase):
+    def test_sequences(self):
+        one = EpDispatchCombineOpHip._asyncll_zc_seq(1)
+        two = EpDispatchCombineOpHip._asyncll_zc_seq(2)
+        for seq in (one, two):
+            self.assertEqual(
+                seq["dispatch_send"],
+                (
+                    "dispatch_slotassign",
+                    "dispatch_sendcopy_zc",
+                    "dispatch_sendtransfer_zc",
+                ),
+            )
+            self.assertEqual(
+                seq["dispatch_recv"],
+                ("dispatch_recvtransfer", "dispatch_recvfinalize_zc"),
+            )
+        self.assertEqual(
+            one["combine_send"], ("combine_sendcopy_zc", "combine_sendtransfer")
+        )
+        self.assertEqual(
+            one["combine_recv"], ("combine_recvtransfer", "combine_recvcopy")
+        )
+        self.assertEqual(two["combine_send"], ("combine_sendtransfer_zc",))
+        self.assertEqual(
+            two["combine_recv"], ("combine_recvtransfer", "combine_recvcopy_zc")
+        )
+
+    def test_layout_fits_the_regions(self):
+        for scale_dim, token_nbytes, zero_copy in ((0, 14336, 0), (224, 7168, 1)):
+            cfg = SimpleNamespace(
+                world_size=8,
+                gpu_per_node=8,
+                hidden_dim=7168,
+                max_num_inp_token_per_rank=100,
+                max_total_recv_tokens=0,
+                num_experts_per_rank=32,
+                num_experts_per_token=6,
+                max_token_type_size=2,
+                token_nbytes=token_nbytes,
+                scale_dim=scale_dim,
+                scale_type_size=1,
+                num_qp_per_pe=2,
+                async_ll_zero_copy=zero_copy,
+            )
+            layout = asyncll_zc_layout(cfg)
+            offsets = [layout[k] for k in ("hidden", "index", "weight", "scale")]
+            self.assertTrue(
+                all(off % 256 == 0 for off in offsets + [layout["src_tok"]])
+            )
+            regions = dict(asyncll_regions(cfg))
+            if zero_copy:
+                self.assertGreaterEqual(regions["inter_dispatch_inp"], layout["bytes"])
+                self.assertGreaterEqual(regions["inter_staging"], layout["bytes"])
+                self.assertEqual(regions["send_count"], (8 * 2 + 8 + 1) * 8)
+            else:
+                self.assertEqual(regions["send_count"], 8 * 2 * 8)
 
 
 if __name__ == "__main__":

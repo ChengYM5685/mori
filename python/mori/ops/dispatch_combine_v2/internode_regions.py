@@ -211,6 +211,17 @@ def asyncll_regions(cfg):
     order.append("send_count")
     regions["send_count"] = world_size * 2 * _U64
 
+    # Zero copy lays the dispatch landing and send staging out per field (see
+    # asyncll_zc_layout), lets the expert write its whole segmented output into
+    # inter_dispatch_staging, and adds the stride handshake to send_count: one
+    # word per source, written by that source's engine, plus the local source.
+    if getattr(cfg, "async_ll_zero_copy", 0):
+        zc_bytes = asyncll_zc_layout(cfg)["bytes"]
+        for name in ("inter_staging", "inter_dispatch_inp"):
+            regions[name] = max(regions[name], zc_bytes)
+        regions["inter_dispatch_staging"] = send_slots * hidden_bytes
+        regions["send_count"] += (world_size + 1) * _U64
+
     # Combine gets its OWN send staging rather than reusing inter_staging.
     #
     # Sharing one buffer is correct but couples the two phases: dispatch's
@@ -229,3 +240,31 @@ def asyncll_regions(cfg):
     regions["inter_combine_staging"] = send_slots * hidden_bytes
 
     return [(name, regions[name]) for name in order]
+
+
+_ZC_ALIGN = 256
+
+
+def asyncll_zc_layout(cfg):
+    """Byte offsets of the zero-copy field blocks in ``inter_dispatch_inp`` and
+    ``inter_staging``, plus the bytes they span.
+
+    Each block holds ``world_size * max_num_inp_token_per_rank`` rows; a zero-copy
+    round with stride S uses rows ``[s * S, s * S + n_s)`` of each for source s.
+    Must match ``asyncll::ZcLayoutOf`` in ep_asyncll_kernel.hpp.
+    """
+    rows = cfg.world_size * cfg.max_num_inp_token_per_rank
+    topk = cfg.num_experts_per_token
+
+    def align(x):
+        return -(-x // _ZC_ALIGN) * _ZC_ALIGN
+
+    layout = {"hidden": 0}
+    layout["index"] = align(rows * cfg.token_nbytes)
+    layout["weight"] = align(layout["index"] + rows * topk * _I32)
+    layout["scale"] = align(layout["weight"] + rows * topk * _F32)
+    layout["src_tok"] = align(
+        layout["scale"] + rows * cfg.scale_dim * cfg.scale_type_size
+    )
+    layout["bytes"] = layout["src_tok"] + rows * _I32
+    return layout

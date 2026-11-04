@@ -234,6 +234,16 @@ class EpDispatchCombineConfig:
     # Set it on both ops of a single-stream two-batch overlap; leave it off when
     # the micro-batches run on their own streams.
     async_ll_own_sdma_queue: bool = False
+    # Zero copy for async_ll over "sdma" on one node (0 = off). A dispatch that
+    # passes zero_copy_stride=S lands source s's rows at [s * S, s * S + n_s) of
+    # the recv views, which then have world_size * S rows: the expert reads them
+    # in place instead of a compact copy, and rows past n_s carry a non-local
+    # expert id with weight 0. S must be the same on every rank and at least
+    # every rank's token count. The expert writes its output in the same layout
+    # into combine_in_view(), and combine sends it from there (2) or first copies
+    # it into the compact combine staging (1). Calls without a stride keep the
+    # compact layout, so one op serves both.
+    async_ll_zero_copy: int = 0
 
     def __post_init__(self):
         # Node grouping first: is_internode gates checks further down, and the
@@ -249,6 +259,12 @@ class EpDispatchCombineConfig:
             )
         if self.num_qp_per_pe < 1:
             raise ValueError(f"num_qp_per_pe must be >= 1, got {self.num_qp_per_pe}")
+        if self.async_ll_zero_copy not in (0, 1, 2):
+            raise ValueError(
+                f"async_ll_zero_copy must be 0, 1 or 2, got {self.async_ll_zero_copy!r}"
+            )
+        if self.async_ll_zero_copy and not self.async_ll:
+            raise ValueError("async_ll_zero_copy needs async_ll=True")
 
         # all-or-none: setting only one silently defaults the other to data_type.
         if (self.dispatch_data_type is None) != (self.combine_data_type is None):
@@ -886,6 +902,14 @@ class EpDispatchCombineOp:
         """Reasons this backend cannot serve `cfg`. Empty = it can."""
         return ()
 
+    def _set_zero_copy_stride(self, stride, num_tokens):
+        """Record this round's zero-copy stride (None or 0 = compact). Only the
+        hip backend's AsyncLL has the layout."""
+        if stride:
+            raise NotImplementedError(
+                f"the {self.backend_name} backend has no zero-copy dispatch"
+            )
+
     def _region(self, name):
         """Arena region a shared view should read.
 
@@ -1013,6 +1037,7 @@ class EpDispatchCombineOp:
         routing=None,
         return_routing=False,
         snapshot=False,
+        zero_copy_stride=None,
     ):
         """mori-parity dispatch. input [n_tok,hidden], weights [n_tok,topk] f32,
         scales [n_tok,scale_dim] (or None), indices [n_tok,topk] i32.
@@ -1038,6 +1063,8 @@ class EpDispatchCombineOp:
         total_recv is a DEVICE tensor. Reading it on the host is a full sync that
         costs more than the kernel and makes the op uncapturable, so neither
         backend does it.
+
+        zero_copy_stride=: see EpDispatchCombineConfig.async_ll_zero_copy.
         """
         with self._asyncll_call("dispatch"):
             return self._dispatch_impl(
@@ -1049,6 +1076,7 @@ class EpDispatchCombineOp:
                 return_routing=return_routing,
                 kernels=self._kernels.dispatch,
                 snapshot=snapshot,
+                zero_copy_stride=zero_copy_stride,
             )
 
     def _dispatch_impl(
@@ -1062,6 +1090,7 @@ class EpDispatchCombineOp:
         return_routing,
         kernels,
         snapshot=False,
+        zero_copy_stride=None,
     ):
         """The body of dispatch(), parameterised by which kernel table runs.
 
@@ -1122,6 +1151,8 @@ class EpDispatchCombineOp:
             else:
                 dest_map = self.token_dest_map
 
+        # Last check before the launch, so a refused stride leaves no state behind.
+        self._set_zero_copy_stride(zero_copy_stride, n)
         kern(
             input=input,
             indices=indices,
@@ -1357,7 +1388,15 @@ class EpDispatchCombineOp:
         return table
 
     def dispatch_send(
-        self, input, weights, scales, indices, *, routing=None, return_routing=False
+        self,
+        input,
+        weights,
+        scales,
+        indices,
+        *,
+        routing=None,
+        return_routing=False,
+        zero_copy_stride=None,
     ):
         """Enqueue the send half of a dispatch and return immediately.
 
@@ -1373,6 +1412,7 @@ class EpDispatchCombineOp:
                 routing=routing,
                 return_routing=return_routing,
                 kernels=self._async_half("dispatch_send"),
+                zero_copy_stride=zero_copy_stride,
             )
 
     def dispatch_recv(self):
@@ -1455,7 +1495,7 @@ class EpDispatchCombineOp:
         # blockFlagCounter, so a reset taken between a dispatch and its combine
         # would leave it advanced and the next dispatch would address slots past
         # its node's slice of the send buffer.
-        for name in ("block_flag_counter", "inter_blocks_barrier"):
+        for name in ("block_flag_counter", "inter_blocks_barrier", "zc_seg_count"):
             counter = getattr(self, name, None)
             if counter is not None:
                 counter.zero_()

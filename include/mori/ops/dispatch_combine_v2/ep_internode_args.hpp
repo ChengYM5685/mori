@@ -280,7 +280,10 @@ __device__ inline int NullSendBufSlotOffset(const EpInterNodeDeviceCfg& config) 
   X(dispatchGridBarrier, "p")            \
   X(interNodeBlocksBarrier, "p")         \
   X(crossDeviceBarrierFlag, "p")         \
-  X(dispReceiverIdxMap, "p")
+  X(dispReceiverIdxMap, "p")             \
+  X(zcSegCount, "p")                     \
+  X(zcStride, "i32")                     \
+  X(zcInvalidExpert, "i32")
 
 #define MORI_EP_INTERNODE_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
 // Trailing comma: the binding skips empty items, so there is no last-element
@@ -369,6 +372,15 @@ struct EpInterNodeArgs {
   // v1 calls this dispReceiverIdxMap and keeps it in plain device memory too.
   ep_index_t* dispReceiverIdxMap{nullptr};
 
+  // AsyncLL zero copy only (EpDispatchCombineConfig.async_ll_zero_copy); appended
+  // so no earlier field moves. zcStride is per call: 0 runs the compact layout,
+  // S > 0 lands source s's rows at [s * S, s * S + n_s). zcSegCount is local
+  // int32[worldSize + 1]: n_s per source, then sticky error bits (ZcErr*).
+  // zcInvalidExpert is the non-local expert id empty rows are pointed at.
+  ep_index_t* zcSegCount{nullptr};
+  int32_t zcStride{0};
+  int32_t zcInvalidExpert{0};
+
   // An offset as something addressable. Built per access; the three members are
   // all the accessors need, so this costs nothing at -O2.
   __device__ __host__ EpInterNodeRegion reg(uint64_t off) const {
@@ -394,7 +406,7 @@ constexpr bool EpInterNodeArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpInterNodeArgsFieldCount == 41,
+static_assert(detail::kEpInterNodeArgsFieldCount == 44,
               "added an EpInterNodeArgs field -- add it to MORI_EP_INTERNODE_ARGS_FIELDS in "
               "the same position and bump this count");
 static_assert(detail::EpInterNodeArgsOffsetsAscend(),
@@ -407,16 +419,17 @@ static_assert(detail::EpInterNodeArgsOffsetsAscend(),
 // builds a ctypes struct from the schema and appends devComm as a BYTE RANGE,
 // whose alignment is 1 -- so ctypes places it immediately after the last field,
 // while C++ places it at sizeof(EpInterNodeArgs), after any tail padding. End
-// the struct with an int32 and the two disagree by 4 bytes: every launch then
+// the struct with a lone int32 and the two disagree by 4 bytes (the trailing
+// int32 PAIR ends on an 8-byte boundary, so it pads nothing): every launch then
 // writes the communicator 4 bytes low and the kernel dereferences garbage QP
 // state. Nothing else catches it -- both layouts have the SAME sizeof, so the
 // binding's size check passes, and the ascending-offset assert above is about
 // the fields, not about what follows them.
-static_assert(offsetof(EpInterNodeArgs, dispReceiverIdxMap) +
-                      sizeof(EpInterNodeArgs::dispReceiverIdxMap) ==
+static_assert(offsetof(EpInterNodeArgs, zcInvalidExpert) +
+                      sizeof(EpInterNodeArgs::zcInvalidExpert) ==
                   sizeof(EpInterNodeArgs),
               "EpInterNodeArgs has tail padding -- the binding would place devComm before "
-              "C++ does. Keep an 8-byte member last (update the name here if it changes)");
+              "C++ does. End on an 8-byte boundary (update the name here if it changes)");
 
 // What crosses into a JIT module: the arguments plus the communicator. Passing
 // the comm by value is the point of the CCO port; mori-shmem needed a device
