@@ -421,11 +421,10 @@ static_assert(detail::EpInterNodeArgsOffsetsAscend(),
 // state. Nothing else catches it -- both layouts have the SAME sizeof, so the
 // binding's size check passes, and the ascending-offset assert above is about
 // the fields, not about what follows them.
-static_assert(offsetof(EpInterNodeArgs, dispReceiverIdxMap) +
-                      sizeof(EpInterNodeArgs::dispReceiverIdxMap) ==
+static_assert(offsetof(EpInterNodeArgs, gapReserved) + sizeof(EpInterNodeArgs::gapReserved) ==
                   sizeof(EpInterNodeArgs),
               "EpInterNodeArgs has tail padding -- the binding would place devComm before "
-              "C++ does. Keep an 8-byte member last (update the name here if it changes)");
+              "C++ does. End on an 8-byte boundary (update the name here if it changes)");
 
 // What crosses into a JIT module: the arguments plus the communicator. Passing
 // the comm by value is the point of the CCO port; mori-shmem needed a device
