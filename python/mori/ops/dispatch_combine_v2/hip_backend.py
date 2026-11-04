@@ -481,6 +481,9 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         # when that pays). LSA posts nothing to an SDMA queue, so it takes none.
         self._sdma_queue_offset = 0
         self._holds_sdma_queue_offset = False
+        # Per-source row stride of the current round's gapped layout; 0 = packed.
+        # Set by dispatch_send, reused by the recv half and the combine after it.
+        self._asyncll_gap_stride = 0
         if (
             cfg.async_ll
             and cfg.async_ll_transport == "sdma"
@@ -1550,9 +1553,12 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 weights_ptr = 0
                 indices = getattr(self, "_asyncll_indices", None)
 
+            if phase == "dispatch" and groups[0] != "dispatch_recv":
+                self._asyncll_gap_stride = int(kwargs.get("gap_stride", 0))
             # Only what varies; everything fixed for the op's lifetime was bound
             # onto the plans in _alloc_internode_buffers.
             args = dict(
+                gapStride=self._asyncll_gap_stride,
                 curRankNumToken=num_tokens,
                 dispDestTokIdMap=dest_map.data_ptr(),
                 tokenIndices=0 if indices is None else indices.data_ptr(),
@@ -1888,6 +1894,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         return view
 
     def combine_in_view(self):
+        if self._asyncll_gap_stride > 0:
+            return self._gapped_combine_in_view(self._asyncll_gap_stride)
         view = self._views.get("combine_in")
         if view is None:
             view = from_gpu_ptr(
@@ -1896,6 +1904,59 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
                 self.cfg.combine_dtype,
             )
             self._views["combine_in"] = view
+        return view
+
+    def asyncll_gap_supported(self) -> bool:
+        """Whether dispatch_send(gap_stride=...) can run: single-node SDMA with
+        early notify, unfused (asyncll::GapFieldOffsets lives on that path only)."""
+        return (
+            self.cfg.async_ll
+            and self.cfg.async_ll_transport == "sdma"
+            and self.cfg.nodes == 1
+            and self._asyncll_mode == 1
+            and not self.cfg.is_fp4
+        )
+
+    def gapped_recv_views(self, stride):
+        """(tokens, weights, scales, indices) over inter_dispatch_inp in the gapped
+        layout: world * stride rows, source s at rows [s * stride, s * stride + n_s).
+        Field offsets must match asyncll::GapFieldOffsets."""
+        key = ("gapped_recv", stride)
+        views = self._views.get(key)
+        if views is not None:
+            return views
+        cfg = self.cfg
+        rows_total = cfg.world_size * cfg.max_num_inp_token_per_rank
+        rows = cfg.world_size * stride
+        topk = cfg.num_experts_per_token
+        hidden_bytes = cfg.token_nbytes
+        scale_bytes = self.scale_stride_bytes() if self._scale_i32(cfg) else 0
+        base = self.arena.local_ptr("inter_dispatch_inp")
+        index_off = rows_total * hidden_bytes
+        weight_off = index_off + rows_total * topk * 4
+        scale_off = weight_off + rows_total * topk * 4
+        tokens = from_gpu_ptr(base, (rows, cfg.hidden_dim), cfg.dispatch_dtype)
+        indices = from_gpu_ptr(base + index_off, (rows, topk), torch.int32)
+        weights = from_gpu_ptr(base + weight_off, (rows, topk), torch.float32)
+        scales = None
+        if scale_bytes:
+            scales = from_gpu_ptr(base + scale_off, (rows, scale_bytes // 4), torch.int32)[
+                :, : self._scale_i32(cfg)
+            ]
+        views = (tokens, weights, scales, indices)
+        self._views[key] = views
+        return views
+
+    def _gapped_combine_in_view(self, stride):
+        key = ("gapped_combine_in", stride)
+        view = self._views.get(key)
+        if view is None:
+            view = from_gpu_ptr(
+                self.arena.local_ptr("inter_combine_staging"),
+                (self.cfg.world_size * stride, self.cfg.hidden_dim),
+                self.cfg.combine_dtype,
+            )
+            self._views[key] = view
         return view
 
     def recv_weights(self):

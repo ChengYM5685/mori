@@ -1062,6 +1062,7 @@ class EpDispatchCombineOp:
         return_routing,
         kernels,
         snapshot=False,
+        gap_stride=0,
     ):
         """The body of dispatch(), parameterised by which kernel table runs.
 
@@ -1122,6 +1123,7 @@ class EpDispatchCombineOp:
             else:
                 dest_map = self.token_dest_map
 
+        extra = {"gap_stride": gap_stride} if gap_stride else {}
         kern(
             input=input,
             indices=indices,
@@ -1129,6 +1131,7 @@ class EpDispatchCombineOp:
             scales=scales,
             dest_map=dest_map,
             num_tokens=n,
+            **extra,
         )
         # What dispatch_recv() needs to launch the other half -- recorded only
         # when this WAS the send half. Recording it for a plain dispatch() was not
@@ -1140,13 +1143,16 @@ class EpDispatchCombineOp:
             self._async_pending_dispatch_input = input
             self._async_pending_dispatch_map = dest_map
 
-        base = (
-            self.recv_tokens(),
-            self.recv_weights(),
-            self.recv_scales(),
-            self.recv_indices(),
-            self.total_recv,
-        )
+        if gap_stride:
+            base = self.gapped_recv_views(gap_stride) + (self.total_recv,)
+        else:
+            base = (
+                self.recv_tokens(),
+                self.recv_weights(),
+                self.recv_scales(),
+                self.recv_indices(),
+                self.total_recv,
+            )
         if not return_routing:
             return base
 
@@ -1202,7 +1208,13 @@ class EpDispatchCombineOp:
         ct = routing.cur_rank_num_token
         _, comb_spec = self._pick(ct)
 
-        if not self._kernels.stages_in_kernel and not self.cfg.enable_std_moe:
+        # Gapped: the expert wrote combine's send staging in place (combine_in_view).
+        gapped = self.cfg.async_ll and self._asyncll_gap_stride > 0
+        if (
+            not self._kernels.stages_in_kernel
+            and not self.cfg.enable_std_moe
+            and not gapped
+        ):
             # StdMoE has already written the weighted-reduced tokens into out_tok;
             # copying `input` over them would clobber that result.
             out_tok_ptr = self.arena.local_ptr(self._region("out_tok"))
@@ -1357,13 +1369,44 @@ class EpDispatchCombineOp:
         return table
 
     def dispatch_send(
-        self, input, weights, scales, indices, *, routing=None, return_routing=False
+        self,
+        input,
+        weights,
+        scales,
+        indices,
+        *,
+        routing=None,
+        return_routing=False,
+        gap_stride=0,
     ):
         """Enqueue the send half of a dispatch and return immediately.
 
         Same arguments and same return as :meth:`dispatch`. The returned views are
         only valid after :meth:`dispatch_recv`.
+
+        ``gap_stride`` > 0 selects the gapped layout for this round (experimental,
+        single-node SDMA with early notify): the views are world_size * gap_stride
+        rows straight over the landing area, source s at rows [s * gap_stride, ...);
+        rows a source did not fill route to experts this rank does not own with
+        zero weight. combine_in_view() then returns combine's send staging in the
+        same layout. Every rank must pass the same stride, at least the largest
+        token count any rank dispatches this round.
         """
+        if gap_stride:
+            if not self.asyncll_gap_supported():
+                raise ValueError(
+                    "gap_stride needs async_ll over sdma on one node with "
+                    "MORI_ASYNCLL_EARLY_NOTIFY=1 and MORI_ASYNCLL_FUSED_RECV=0, non-fp4"
+                )
+            if not 0 < gap_stride <= self.cfg.max_num_inp_token_per_rank:
+                raise ValueError(
+                    f"gap_stride={gap_stride} outside (0, max_num_inp_token_per_rank="
+                    f"{self.cfg.max_num_inp_token_per_rank}]"
+                )
+            if input.shape[0] > gap_stride:
+                raise ValueError(
+                    f"{input.shape[0]} tokens exceed gap_stride={gap_stride}"
+                )
         with self._asyncll_call("dispatch_send"):
             return self._dispatch_impl(
                 input,
@@ -1373,6 +1416,7 @@ class EpDispatchCombineOp:
                 routing=routing,
                 return_routing=return_routing,
                 kernels=self._async_half("dispatch_send"),
+                gap_stride=gap_stride,
             )
 
     def dispatch_recv(self):

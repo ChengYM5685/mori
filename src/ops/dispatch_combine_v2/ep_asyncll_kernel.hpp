@@ -207,6 +207,85 @@ __device__ __forceinline__ void LaneCopyWords(uint8_t* dst, const uint8_t* src, 
   }
 }
 
+// Gapped layout (args.gapStride > 0). inter_staging and inter_dispatch_inp hold one
+// array per field instead of one record per token, so the caller's expert can read
+// the landing area in place: hidden at 0, then indices, weights, scales, source
+// token. Every array has worldSize * MaxNumTokensToSendPerRank rows, which keeps
+// each region's size. Staging rows keep SendBufSlotOffset; landing rows are
+// srcPe * gapStride + slot, so the landing area is worldSize * gapStride dense rows.
+constexpr int kGapFields = 5;
+
+struct GapFieldLayout {
+  size_t offset[kGapFields];
+  size_t rowBytes[kGapFields];
+};
+
+__device__ __forceinline__ GapFieldLayout GapFieldOffsets(const EpInterNodeDeviceCfg& config,
+                                                          size_t hiddenBytes, size_t indexBytes,
+                                                          size_t weightBytes, size_t scaleBytes,
+                                                          size_t srcTokenIdBytes) {
+  const size_t rows =
+      static_cast<size_t>(config.worldSize) * config.MaxNumTokensToSendPerRank();
+  GapFieldLayout g;
+  g.rowBytes[0] = hiddenBytes;
+  g.rowBytes[1] = indexBytes;
+  g.rowBytes[2] = weightBytes;
+  g.rowBytes[3] = scaleBytes;
+  g.rowBytes[4] = srcTokenIdBytes;
+  size_t off = 0;
+  for (int f = 0; f < kGapFields; ++f) {
+    g.offset[f] = off;
+    off += rows * g.rowBytes[f];
+  }
+  return g;
+}
+
+// The gapped counterpart of PostPayloadAndNotify: one SDMA copy per field of `n`
+// rows, then the ready word, all in one reservation so the word lands last.
+__device__ __forceinline__ void PostGapFieldsAndNotify(
+    const ::mori::cco::ccoDevComm& comm, int peer, int queueId, const GapFieldLayout& g,
+    ::mori::cco::ccoWindow_t dstWin, EpInterNodeRegion dstReg, size_t dstRow,
+    ::mori::cco::ccoWindow_t srcWin, EpInterNodeRegion srcReg, size_t srcRow, size_t n,
+    ::mori::cco::ccoWindow_t notifyDstWin, size_t notifyDstOffset,
+    ::mori::cco::ccoWindow_t notifySrcWin, size_t notifySrcOffset) {
+  ::mori::cco::ccoSdma sdma{comm};
+  const int lane = threadIdx.x & (warpSize - 1);
+  bool chunked = false;
+  for (int f = 0; f < kGapFields; ++f)
+    chunked = chunked || (n * g.rowBytes[f] > ::mori::cco::CCO_SDMA_MAX_COPY_BYTES);
+  if (chunked) {
+    for (int f = 0; f < kGapFields; ++f) {
+      if (n == 0 || g.rowBytes[f] == 0) continue;
+      sdma.put<::mori::cco::ccoCoopWarp>(
+          peer, dstWin, EpInterNodeOffset(dstReg, g.offset[f] + dstRow * g.rowBytes[f]), srcWin,
+          EpInterNodeOffset(srcReg, g.offset[f] + srcRow * g.rowBytes[f]), n * g.rowBytes[f],
+          queueId);
+    }
+    if (lane == 0)
+      sdma.put(peer, notifyDstWin, notifyDstOffset, notifySrcWin, notifySrcOffset, sizeof(uint64_t),
+               queueId);
+    return;
+  }
+  size_t rowBytes = 0, fieldOffset = 0;
+  for (int f = 0; f < kGapFields; ++f) {
+    if (lane == f) {
+      rowBytes = g.rowBytes[f];
+      fieldOffset = g.offset[f];
+    }
+  }
+  const bool payload = lane < kGapFields && n != 0 && rowBytes != 0;
+  const bool notify = lane == kGapFields;
+  if (payload || notify) {
+    sdma.put<::mori::cco::ccoCoopThread, false, false, ::mori::cco::ccoSdmaOptFlagsDefault,
+             ::mori::cco::ccoSdmaThreadSameQueue>(
+        peer, notify ? notifyDstWin : dstWin,
+        notify ? notifyDstOffset : EpInterNodeOffset(dstReg, fieldOffset + dstRow * rowBytes),
+        notify ? notifySrcWin : srcWin,
+        notify ? notifySrcOffset : EpInterNodeOffset(srcReg, fieldOffset + srcRow * rowBytes),
+        notify ? sizeof(uint64_t) : n * rowBytes, queueId);
+  }
+}
+
 }  // namespace asyncll
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -369,6 +448,47 @@ __device__ void EpDispatchAsyncLLSendCopy_body(EpDispatchCombineArgs args) {
     if (destTokOffset >= NullSendBufSlotOffset(config)) continue;
 
     const index_t srcTokId = entryId / config.numExpertPerToken;
+
+    if (args.gapStride > 0) {
+      const index_t destPe = PeFromSendBufSlotOffset(config, destTokOffset);
+      const index_t slot = destTokOffset - SendBufSlotOffset(config, destPe, 0);
+      // Past the stride it would land in the next source's rows; the host sizes
+      // the stride from every rank's token count, so this only guards the arena.
+      if (slot >= args.gapStride) continue;
+      // Own tokens go straight to the landing area: no transfer reads them.
+      const bool self = destPe == myPe;
+      uint8_t* base = self ? args.reg(args.offDispatchInp)->template GetAs<uint8_t*>() : stagingPtr;
+      const size_t row = self ? static_cast<size_t>(myPe) * args.gapStride + slot
+                              : static_cast<size_t>(destTokOffset);
+      const asyncll::GapFieldLayout g = asyncll::GapFieldOffsets(
+          config, hiddenBytes, indexBytes, weightBytes, scaleBytes, srcTokenIdBytes);
+      const size_t hiddenOffset = inTokenPartId * hiddenBytesPerWarp;
+      if (hiddenOffset < hiddenBytes) {
+        const size_t len = min(hiddenBytesPerWarp, hiddenBytes - hiddenOffset);
+        core::WarpCopy<uint8_t, 1>(
+            base + row * hiddenBytes + hiddenOffset,
+            static_cast<const uint8_t*>(args.inpTokenBuf) + srcTokId * hiddenBytes + hiddenOffset,
+            len);
+      }
+      if (inTokenPartId == 0) {
+        core::WarpCopy<uint8_t, 1>(base + g.offset[1] + row * indexBytes,
+                                   reinterpret_cast<uint8_t*>(args.tokenIndices) +
+                                       srcTokId * indexBytes,
+                                   indexBytes);
+        if (args.weightsBuf)
+          core::WarpCopy<uint8_t, 1>(
+              base + g.offset[2] + row * weightBytes,
+              reinterpret_cast<uint8_t*>(args.weightsBuf) + srcTokId * weightBytes, weightBytes);
+        if (args.scalesBuf && (scaleBytes > 0))
+          core::WarpCopy<uint8_t, 1>(base + g.offset[3] + row * scaleBytes,
+                                     args.scalesBuf + srcTokId * scaleBytes, scaleBytes);
+        if (laneId == 0)
+          reinterpret_cast<index_t*>(base + g.offset[4] + row * srcTokenIdBytes)[0] =
+              static_cast<index_t>(asyncll::SrcTokenIndex(config, myPe, srcTokId));
+      }
+      continue;
+    }
+
     uint8_t* dst = stagingPtr + static_cast<size_t>(destTokOffset) * xferBytes;
 
     const size_t hiddenOffset = inTokenPartId * hiddenBytesPerWarp;
@@ -522,6 +642,20 @@ __device__ void EpDispatchAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
               reinterpret_cast<uint64_t*>(recvCounts + asyncll::RecvCountSlot(myPe)),
               static_cast<uint64_t>(tokenNum) + 1);
         }
+      } else if (args.gapStride > 0) {
+        const asyncll::GapFieldLayout g = asyncll::GapFieldOffsets(
+            config, hiddenBytes, indexBytes, weightBytes, scaleBytes, srcTokenIdBytes);
+        asyncll::PostGapFieldsAndNotify(
+            comm, destPe - args.lsaBase, asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset),
+            g, EpInterNodeWindow(args.reg(args.offDispatchInp)), args.reg(args.offDispatchInp),
+            static_cast<size_t>(myPe) * args.gapStride,
+            EpInterNodeWindow(args.reg(args.offStaging)), args.reg(args.offStaging),
+            static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)),
+            static_cast<size_t>(min(tokenNum, args.gapStride)),
+            EpInterNodeWindow(args.reg(args.offRecvTokenNum)),
+            EpInterNodeOffset(args.reg(args.offRecvTokenNum), asyncll::RecvCountSlot(myPe)),
+            EpInterNodeWindow(args.reg(args.offSendCount)),
+            EpInterNodeOffset(args.reg(args.offSendCount), asyncll::SendCountSlot(destPe)));
       } else {
         const size_t remoteBase =
             static_cast<size_t>(SendBufSlotOffset(config, myPe, 0)) * xferBytes;
@@ -718,6 +852,41 @@ __device__ void EpDispatchAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
   uint64_t peExclusive = __shfl_up(inclusive, 1);
   if (laneId == 0) peExclusive = 0;
   const uint64_t totalTokens = __shfl(inclusive, npes - 1);
+
+  if (args.gapStride > 0) {
+    // Nothing to unpack: the expert reads the landing area in place. Rows past a
+    // source's count still hold an older round's tokens, so point them at experts
+    // this rank does not own, with zero weight; the caller's expert_mask drops them.
+    const asyncll::GapFieldLayout g = asyncll::GapFieldOffsets(
+        config, hiddenBytes, indexBytes, weightBytes, scaleBytes, srcTokenIdBytes);
+    uint8_t* landing = args.reg(args.offDispatchInp)->template GetAs<uint8_t*>();
+    const int stride = args.gapStride;
+    const int rows = npes * stride;
+    const int perRank = config.numExpertPerRank;
+    const int maskBase = ((myPe + 1) % npes) * perRank;
+    for (int r = globalThdId; r < rows; r += globalThdNum) {
+      const int srcPe = r / stride;
+      const uint64_t announced =
+          *reinterpret_cast<const uint64_t*>(recvCounts + asyncll::RecvCountSlot(srcPe));
+      const uint64_t count = announced > 0 ? announced - 1 : 0;
+      if (static_cast<uint64_t>(r - srcPe * stride) < count) continue;
+      index_t* ids = reinterpret_cast<index_t*>(landing + g.offset[1] + r * indexBytes);
+      float* weights = reinterpret_cast<float*>(landing + g.offset[2] + r * weightBytes);
+      for (int k = 0; k < numExpertPerToken; ++k) {
+        ids[k] = maskBase + (k % perRank);
+        weights[k] = 0.0f;
+      }
+    }
+    if (globalWarpId == 0) {
+      if (laneId == 0) args.totalRecvTokenNum[0] = static_cast<index_t>(rows);
+      if (laneId < npes) args.destPeTokenCounter[laneId] = 0;
+      if (laneId == 0) {
+        args.dispatchGridBarrier[0] = 0;
+        atomicAdd(args.crossDeviceBarrierFlag, 1ull);
+      }
+    }
+    return;
+  }
 
   const uint8_t* peerBase = args.reg(args.offDispatchInp)->template GetAs<const uint8_t*>();
   // This rank's own tokens were never transferred; they are still in staging.
@@ -1119,6 +1288,8 @@ __device__ void EpCombineAsyncLLSendCopy_body(EpDispatchCombineArgs args) {
       // particular the count clear must land before a peer starts its next round.
     }
   }
+  // Gapped: the expert already wrote its output here, one segment per source.
+  if (args.gapStride > 0) return;
   const index_t totalRecvTokenNum = args.totalRecvTokenNum[0];
   // Combine's own staging, not dispatch's: writing dispatch's here would race
   // its transfer still reading it. See asyncll_regions.
@@ -1168,8 +1339,10 @@ __device__ void EpCombineAsyncLLSendTransfer_body(EpDispatchCombineArgs args,
       } else {
         const size_t remoteBase =
             static_cast<size_t>(SendBufSlotOffset(config, myPe, 0)) * hiddenBytes;
-        const size_t localBase =
-            static_cast<size_t>(SendBufSlotOffset(config, destPe, 0)) * hiddenBytes;
+        const size_t localRow = (args.gapStride > 0)
+                                    ? static_cast<size_t>(destPe) * args.gapStride
+                                    : static_cast<size_t>(SendBufSlotOffset(config, destPe, 0));
+        const size_t localBase = localRow * hiddenBytes;
         asyncll::PostPayloadAndNotify(
             comm, destPe - args.lsaBase, asyncll::QueueForPe(comm, destPe, args.sdmaQueueOffset),
             EpInterNodeWindow(args.reg(args.offCombineInp)),
@@ -1344,7 +1517,13 @@ __device__ void EpCombineAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
         // staging where SendCopy put them.
         T* base = (destPe != myPe) ? args.reg(args.offCombineInp)->template GetAs<T*>()
                                    : args.reg(args.offCombineStaging)->template GetAs<T*>();
-        srcPtrs[j] = base + static_cast<size_t>(destTokId) * hiddenDim + hiddenDimOffset;
+        // Gapped: own tokens sit in the expert output at this rank's segment.
+        const size_t row =
+            (destPe == myPe && args.gapStride > 0)
+                ? static_cast<size_t>(myPe) * args.gapStride +
+                      (destTokId - SendBufSlotOffset(config, myPe, 0))
+                : static_cast<size_t>(destTokId);
+        srcPtrs[j] = base + row * hiddenDim + hiddenDimOffset;
       } else {
         srcPtrs[j] = nullptr;
       }

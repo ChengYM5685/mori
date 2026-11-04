@@ -280,7 +280,9 @@ __device__ inline int NullSendBufSlotOffset(const EpInterNodeDeviceCfg& config) 
   X(dispatchGridBarrier, "p")            \
   X(interNodeBlocksBarrier, "p")         \
   X(crossDeviceBarrierFlag, "p")         \
-  X(dispReceiverIdxMap, "p")
+  X(dispReceiverIdxMap, "p")              \
+  X(gapStride, "i32")                    \
+  X(gapReserved, "i32")
 
 #define MORI_EP_INTERNODE_ARGS_SCHEMA_ENTRY(name, tag) #name ":" tag ","
 // Trailing comma: the binding skips empty items, so there is no last-element
@@ -369,6 +371,13 @@ struct EpInterNodeArgs {
   // v1 calls this dispReceiverIdxMap and keeps it in plain device memory too.
   ep_index_t* dispReceiverIdxMap{nullptr};
 
+  // AsyncLL/SDMA, per call: 0 keeps the packed layout. A positive value is the
+  // per-source row stride of the gapped layout (see asyncll::GapFieldOffsets);
+  // the expert reads the landing area in place and writes combine's staging.
+  int32_t gapStride{0};
+  // Keeps the struct a multiple of 8 so the devComm bytes after it do not move.
+  int32_t gapReserved{0};
+
   // An offset as something addressable. Built per access; the three members are
   // all the accessors need, so this costs nothing at -O2.
   __device__ __host__ EpInterNodeRegion reg(uint64_t off) const {
@@ -394,7 +403,7 @@ constexpr bool EpInterNodeArgsOffsetsAscend() {
 
 }  // namespace detail
 
-static_assert(detail::kEpInterNodeArgsFieldCount == 41,
+static_assert(detail::kEpInterNodeArgsFieldCount == 43,
               "added an EpInterNodeArgs field -- add it to MORI_EP_INTERNODE_ARGS_FIELDS in "
               "the same position and bump this count");
 static_assert(detail::EpInterNodeArgsOffsetsAscend(),
