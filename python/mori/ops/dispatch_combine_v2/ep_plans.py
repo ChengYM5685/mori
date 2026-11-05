@@ -231,7 +231,6 @@ _ASYNCLL_ZC_PASSES = frozenset(
         "dispatch_sendcopy_zc",
         "dispatch_sendtransfer_zc",
         "dispatch_recvfinalize_zc",
-        "combine_sendcopy_zc",
         "combine_sendtransfer_zc",
         "combine_recvcopy_zc",
     }

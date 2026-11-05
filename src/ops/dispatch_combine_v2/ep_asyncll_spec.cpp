@@ -77,8 +77,6 @@ AsyncLLDescriptor DescriptorFor(EpAsyncLLKernel kind) {
       return {"dispatch_sendtransfer_zc", "EpDispatchAsyncLLSendTransferZc_body"};
     case EpAsyncLLKernel::DispatchRecvFinalizeZc:
       return {"dispatch_recvfinalize_zc", "EpDispatchAsyncLLRecvFinalizeZc_body"};
-    case EpAsyncLLKernel::CombineSendCopyZc:
-      return {"combine_sendcopy_zc", "EpCombineAsyncLLSendCopyZc_body"};
     case EpAsyncLLKernel::CombineSendTransferZc:
       return {"combine_sendtransfer_zc", "EpCombineAsyncLLSendTransferZc_body"};
     case EpAsyncLLKernel::CombineRecvCopyZc:
@@ -214,7 +212,6 @@ mori::jit::v2::LaunchGeometry EpAsyncLLGeometry(const EpInterNodeCfg& cfg, EpAsy
     case EpAsyncLLKernel::CombineSendCopy:
     case EpAsyncLLKernel::DispatchSendCopyZc:
     case EpAsyncLLKernel::DispatchRecvFinalizeZc:
-    case EpAsyncLLKernel::CombineSendCopyZc:
       geometry.gridX = static_cast<unsigned>(EpAsyncLLAlignGrid(cfg.mpCount, worldSize));
       geometry.sharedBytes = 0;
       break;
@@ -288,7 +285,6 @@ MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLCombineRecvTransferLsaSpec, CombineRecvTran
 MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLDispatchSendCopyZcSpec, DispatchSendCopyZc)
 MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLDispatchSendTransferZcSpec, DispatchSendTransferZc)
 MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLDispatchRecvFinalizeZcSpec, DispatchRecvFinalizeZc)
-MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLCombineSendCopyZcSpec, CombineSendCopyZc)
 MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLCombineSendTransferZcSpec, CombineSendTransferZc)
 MORI_EP_ASYNCLL_DEFINE_SPEC(EpAsyncLLCombineRecvCopyZcSpec, CombineRecvCopyZc)
 
@@ -357,6 +353,5 @@ MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_dispatch_sendtransfer_zc,
                             EpAsyncLLDispatchSendTransferZcSpec)
 MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_dispatch_recvfinalize_zc,
                             EpAsyncLLDispatchRecvFinalizeZcSpec)
-MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_combine_sendcopy_zc, EpAsyncLLCombineSendCopyZcSpec)
 MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_combine_sendtransfer_zc, EpAsyncLLCombineSendTransferZcSpec)
 MORI_EP_ASYNCLL_DEFINE_PLAN(ep_asyncll_combine_recvcopy_zc, EpAsyncLLCombineRecvCopyZcSpec)

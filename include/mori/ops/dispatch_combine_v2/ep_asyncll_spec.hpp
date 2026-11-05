@@ -75,13 +75,11 @@ enum class EpAsyncLLKernel {
   CombineRecvTransferLsa,
   // Zero copy (args.zcStride > 0): the expert reads the per-source landing
   // segments in place. SendCopyZc/SendTransferZc replace the SDMA send pair,
-  // RecvFinalizeZc replaces DispatchRecvCopy; CombineSendCopyZc gathers the
-  // segmented expert output into the compact combine staging, while
-  // CombineSendTransferZc + CombineRecvCopyZc send it in place instead.
+  // RecvFinalizeZc replaces DispatchRecvCopy, and CombineSendTransferZc +
+  // CombineRecvCopyZc send the segmented expert output in place.
   DispatchSendCopyZc,
   DispatchSendTransferZc,
   DispatchRecvFinalizeZc,
-  CombineSendCopyZc,
   CombineSendTransferZc,
   CombineRecvCopyZc,
 };
@@ -138,7 +136,6 @@ MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLDispatchSendTransferZcSpec,
                              "ep_asyncll_dispatch_sendtransfer_zc");
 MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLDispatchRecvFinalizeZcSpec,
                              "ep_asyncll_dispatch_recvfinalize_zc");
-MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineSendCopyZcSpec, "ep_asyncll_combine_sendcopy_zc");
 MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineSendTransferZcSpec,
                              "ep_asyncll_combine_sendtransfer_zc");
 MORI_EP_ASYNCLL_DECLARE_SPEC(EpAsyncLLCombineRecvCopyZcSpec, "ep_asyncll_combine_recvcopy_zc");

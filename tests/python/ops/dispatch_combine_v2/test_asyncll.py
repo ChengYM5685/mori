@@ -64,8 +64,9 @@ Three scenarios target the protocol rather than the data path:
     queues are process-wide, so the ops must take different queue offsets or each
     recv's drain also waits for the other op's transfers.
 
-Zero copy (async_ll_zero_copy; ZERO_COPY=0 skips, other transports and the fused
-receive only check that it is refused) runs both levels, bf16 and fp8 with scales:
+Zero copy (async_ll_zero_copy; ZERO_COPY=0 skips; on other transports and with
+the fused receive it only checks that True is refused and "auto" resolves to off)
+runs bf16 and fp8 with scales, the fp8 op built with "auto":
 every segment holds exactly its source's tokens and every other row is
 invalidated, through stride changes, shrinking counts under one stride, a
 compact round on the same op, refused arguments and a stride one rank gets
@@ -884,7 +885,7 @@ def run_call_order(d, comm):
 # --- zero copy (async_ll_zero_copy) -------------------------------------------
 
 
-def _zc_config(d, hidden, topk, epr, m, level, fp8, own_queue=False):
+def _zc_config(d, hidden, topk, epr, m, zero_copy, fp8, own_queue=False):
     """An SDMA AsyncLL op with zero copy; fp8 adds MXFP8-like scales (one e8m0
     byte per 32 elements), the layout sglang dispatches."""
     extra = {}
@@ -908,7 +909,7 @@ def _zc_config(d, hidden, topk, epr, m, level, fp8, own_queue=False):
         kernel_backend="hip",
         async_ll=True,
         async_ll_transport="sdma",
-        async_ll_zero_copy=level,
+        async_ll_zero_copy=zero_copy,
         **extra,
     )
 
@@ -1014,7 +1015,7 @@ def _zc_check_dispatch(d, snap, stride, gathered, m, epr, tag):
 def _zc_identity_expert(op, out, reverse, rows, separate=False):
     """Write the identity expert's output in the segment layout, empty rows NaN so
     a combine that reads one cannot pass. separate=True returns a tensor of its
-    own (level 2 must then stage it into the arena)."""
+    own (combine must then stage it into the arena)."""
     stage = op.combine_in_view()
     target = torch.empty_like(stage) if separate else stage
     target.copy_(out.to(target.dtype))
@@ -1050,7 +1051,7 @@ def _zc_flags(d, op, tag, want=0):
     return 0
 
 
-def run_zero_copy(d, comm, level, fp8):
+def run_zero_copy(d, comm, zero_copy, fp8):
     """One op, rounds checked one at a time: strides that are exact, the full
     capacity, and change between rounds; a round whose counts shrink under the
     same stride (the previous round's rows must be invalidated); a compact round
@@ -1074,8 +1075,16 @@ def run_zero_copy(d, comm, level, fp8):
     ]
     failures = 0
     with EpDispatchCombineOp(
-        _zc_config(d, hidden, topk, epr, m, level, fp8), comm
+        _zc_config(d, hidden, topk, epr, m, zero_copy, fp8), comm
     ) as op:
+        if op.cfg.async_ll_zero_copy is not True:
+            print(
+                f"[rank {rank}] zc {zero_copy!r}: resolved to "
+                f"{op.cfg.async_ll_zero_copy!r} on a supported config",
+                flush=True,
+            )
+            return 1
+        level = "auto" if zero_copy == "auto" else "on"
         for r, (counts, stride, weighted, split) in enumerate(rounds):
             n = counts[rank]
             x, weights, scales, idx, gathered = _zc_inputs(
@@ -1208,12 +1217,12 @@ def run_zero_copy(d, comm, level, fp8):
 
 
 def run_zero_copy_two_ops(d, comm_a, comm_b, layers, fp8):
-    """Two zero-copy ops (A in place, B through the combine copy) in the
+    """Two zero-copy ops (A built with True, B with "auto") in the
     single-stream TBO order of run_two_ops_interleaved, no host sync, a different
     stride per op and per layer and counts that shrink under an unchanged stride."""
     hidden, topk, epr = 4096, 6, 16
     caps = (64, 48)
-    levels = (2, 1)
+    modes = (True, "auto")
     rank, world = d.rank, d.world
     dev = torch.device("cuda", int(os.environ.get("LOCAL_RANK", rank)))
 
@@ -1238,8 +1247,8 @@ def run_zero_copy_two_ops(d, comm_a, comm_b, layers, fp8):
 
     failures = 0
     cfgs = [
-        _zc_config(d, hidden, topk, epr, m, level, fp8, own_queue=True)
-        for m, level in zip(caps, levels)
+        _zc_config(d, hidden, topk, epr, m, mode, fp8, own_queue=True)
+        for m, mode in zip(caps, modes)
     ]
     op_a = EpDispatchCombineOp(cfgs[0], comm_a)
     with op_a, EpDispatchCombineOp(cfgs[1], comm_b) as op_b:
@@ -1298,15 +1307,28 @@ def run_zero_copy_two_ops(d, comm_a, comm_b, layers, fp8):
 
 def run_zero_copy_refused(d, comm):
     """Zero copy is SDMA on one node without the fused receive; anything else is
-    refused when the op is built."""
+    refused when the op is built with True, and resolves to off with "auto"."""
+    failures = 0
     try:
-        cfg = _zc_config(d, 2048, 8, 8, 32, 1, False)
+        cfg = _zc_config(d, 2048, 8, 8, 32, True, False)
         cfg.async_ll_transport = os.environ.get("TRANSPORT", "sdma")
         EpDispatchCombineOp(cfg, comm).close()
     except ValueError:
-        return 0
-    print(f"[rank {d.rank}] zero copy accepted where it must be refused", flush=True)
-    return 1
+        pass
+    else:
+        print(f"[rank {d.rank}] zero copy accepted where it must be refused", flush=True)
+        failures += 1
+    cfg = _zc_config(d, 2048, 8, 8, 32, "auto", False)
+    cfg.async_ll_transport = os.environ.get("TRANSPORT", "sdma")
+    with EpDispatchCombineOp(cfg, comm) as op:
+        if op.cfg.async_ll_zero_copy is not False:
+            print(
+                f"[rank {d.rank}] zero copy 'auto' resolved to "
+                f"{op.cfg.async_ll_zero_copy!r} where it is unsupported",
+                flush=True,
+            )
+            failures += 1
+    return failures
 
 
 def main():
@@ -1402,16 +1424,16 @@ def main():
             failures += own_comm(lambda c: run_zero_copy_refused(d, c), 2048, 32)
             zc_runs = "refused"
         else:
-            for level in (1, 2):
-                for fp8 in (False, True):
-                    failures += own_comm(
-                        lambda c: run_zero_copy(d, c, level, fp8), 4096, 64
+            for fp8 in (False, True):
+                mode = "auto" if fp8 else True
+                failures += own_comm(
+                    lambda c: run_zero_copy(d, c, mode, fp8), 4096, 64
+                )
+                if d.rank == 0:
+                    print(
+                        f"# asyncll zero copy mode={mode!r} fp8={fp8}: done",
+                        flush=True,
                     )
-                    if d.rank == 0:
-                        print(
-                            f"# asyncll zero copy level={level} fp8={fp8}: done",
-                            flush=True,
-                        )
             if two_ops:
                 failures += own_comm(
                     lambda ca: own_comm(
@@ -1427,7 +1449,7 @@ def main():
                         f"# asyncll zero copy two ops interleaved: {two_ops} layers done",
                         flush=True,
                     )
-            zc_runs = "levels 1-2"
+            zc_runs = "on, auto"
         if d.rank == 0:
             print(f"# asyncll zero copy: {zc_runs}", flush=True)
 

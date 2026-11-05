@@ -26,6 +26,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig
 from mori.ops.dispatch_combine_v2.hip_backend import EpDispatchCombineOpHip
 from mori.ops.dispatch_combine_v2.internode_regions import (
     asyncll_regions,
@@ -105,31 +106,45 @@ class AsyncLLOptionsTest(unittest.TestCase):
 
 class AsyncLLZeroCopyTest(unittest.TestCase):
     def test_sequences(self):
-        one = EpDispatchCombineOpHip._asyncll_zc_seq(1)
-        two = EpDispatchCombineOpHip._asyncll_zc_seq(2)
-        for seq in (one, two):
-            self.assertEqual(
-                seq["dispatch_send"],
-                (
-                    "dispatch_slotassign",
-                    "dispatch_sendcopy_zc",
-                    "dispatch_sendtransfer_zc",
-                ),
+        seq = EpDispatchCombineOpHip._asyncll_zc_seq()
+        self.assertEqual(
+            seq["dispatch_send"],
+            ("dispatch_slotassign", "dispatch_sendcopy_zc", "dispatch_sendtransfer_zc"),
+        )
+        self.assertEqual(
+            seq["dispatch_recv"], ("dispatch_recvtransfer", "dispatch_recvfinalize_zc")
+        )
+        self.assertEqual(seq["combine_send"], ("combine_sendtransfer_zc",))
+        self.assertEqual(
+            seq["combine_recv"], ("combine_recvtransfer", "combine_recvcopy_zc")
+        )
+
+    def test_config_values(self):
+        def cfg(zero_copy, async_ll=True):
+            return EpDispatchCombineConfig(
+                rank=0,
+                world_size=8,
+                hidden_dim=7168,
+                max_num_inp_token_per_rank=64,
+                num_experts_per_rank=48,
+                num_experts_per_token=6,
+                kernel_backend="hip",
+                async_ll=async_ll,
+                async_ll_transport="sdma",
+                async_ll_zero_copy=zero_copy,
             )
-            self.assertEqual(
-                seq["dispatch_recv"],
-                ("dispatch_recvtransfer", "dispatch_recvfinalize_zc"),
-            )
-        self.assertEqual(
-            one["combine_send"], ("combine_sendcopy_zc", "combine_sendtransfer")
-        )
-        self.assertEqual(
-            one["combine_recv"], ("combine_recvtransfer", "combine_recvcopy")
-        )
-        self.assertEqual(two["combine_send"], ("combine_sendtransfer_zc",))
-        self.assertEqual(
-            two["combine_recv"], ("combine_recvtransfer", "combine_recvcopy_zc")
-        )
+
+        for value, want in ((False, False), (True, True), (0, False), (1, True)):
+            with self.subTest(value=value):
+                self.assertIs(cfg(value).async_ll_zero_copy, want)
+        self.assertEqual(cfg("auto").async_ll_zero_copy, "auto")
+        # "auto" without async_ll resolves to off at once; True there is an error.
+        self.assertIs(cfg("auto", async_ll=False).async_ll_zero_copy, False)
+        for bad in (2, "on"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                cfg(bad)
+        with self.assertRaises(ValueError):
+            cfg(True, async_ll=False)
 
     def test_layout_fits_the_regions(self):
         for scale_dim, token_nbytes, zero_copy in ((0, 14336, 0), (224, 7168, 1)):

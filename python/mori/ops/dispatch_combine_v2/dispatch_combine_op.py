@@ -234,16 +234,19 @@ class EpDispatchCombineConfig:
     # Set it on both ops of a single-stream two-batch overlap; leave it off when
     # the micro-batches run on their own streams.
     async_ll_own_sdma_queue: bool = False
-    # Zero copy for async_ll over "sdma" on one node (0 = off). A dispatch that
-    # passes zero_copy_stride=S lands source s's rows at [s * S, s * S + n_s) of
-    # the recv views, which then have world_size * S rows: the expert reads them
-    # in place instead of a compact copy, and rows past n_s carry a non-local
-    # expert id with weight 0. S must be the same on every rank and at least
-    # every rank's token count. The expert writes its output in the same layout
-    # into combine_in_view(), and combine sends it from there (2) or first copies
-    # it into the compact combine staging (1). Calls without a stride keep the
-    # compact layout, so one op serves both.
-    async_ll_zero_copy: int = 0
+    # Zero copy for async_ll over "sdma" on one node. A dispatch that passes
+    # zero_copy_stride=S lands source s's rows at [s * S, s * S + n_s) of the recv
+    # views, which then have world_size * S rows: the expert reads them in place
+    # instead of a compact copy, and rows past n_s carry a non-local expert id with
+    # weight 0. S must be the same on every rank and at least every rank's token
+    # count. The expert writes its output in the same layout into
+    # combine_in_view(), and combine sends it from there. Calls without a stride
+    # keep the compact layout, so one op serves both.
+    #
+    # True requires a config that supports it (the op refuses otherwise); "auto"
+    # turns it on exactly when the config does, with no error, and the op's
+    # cfg.async_ll_zero_copy then reads the outcome (True or False).
+    async_ll_zero_copy: bool | str = False
 
     def __post_init__(self):
         # Node grouping first: is_internode gates checks further down, and the
@@ -259,11 +262,16 @@ class EpDispatchCombineConfig:
             )
         if self.num_qp_per_pe < 1:
             raise ValueError(f"num_qp_per_pe must be >= 1, got {self.num_qp_per_pe}")
-        if self.async_ll_zero_copy not in (0, 1, 2):
-            raise ValueError(
-                f"async_ll_zero_copy must be 0, 1 or 2, got {self.async_ll_zero_copy!r}"
-            )
-        if self.async_ll_zero_copy and not self.async_ll:
+        if self.async_ll_zero_copy != "auto":
+            if self.async_ll_zero_copy not in (False, True):
+                raise ValueError(
+                    "async_ll_zero_copy must be False, True or 'auto', got "
+                    f"{self.async_ll_zero_copy!r}"
+                )
+            self.async_ll_zero_copy = bool(self.async_ll_zero_copy)
+        elif not self.async_ll:
+            self.async_ll_zero_copy = False
+        if self.async_ll_zero_copy is True and not self.async_ll:
             raise ValueError("async_ll_zero_copy needs async_ll=True")
 
         # all-or-none: setting only one silently defaults the other to data_type.

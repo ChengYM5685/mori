@@ -51,6 +51,7 @@ FlyDSL is not installed.
 from __future__ import annotations
 
 import collections
+import dataclasses
 import os
 
 import torch
@@ -430,6 +431,14 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._multi_processor_count = torch.cuda.get_device_properties(
             dev
         ).multi_processor_count
+
+        # "auto" resolves before the gate and the arena, from the config alone,
+        # so every rank reaches the same answer; the regions depend on it.
+        if cfg.async_ll_zero_copy == "auto":
+            cfg = dataclasses.replace(
+                cfg, async_ll_zero_copy=not self._asyncll_zero_copy_unsupported(cfg)
+            )
+            self.cfg = cfg
 
         # Gate FIRST: rejecting a config after taking a symmetric window would
         # leak it (the arena is registered with the communicator), and the whole
@@ -1406,9 +1415,8 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
     )
 
     # Zero-copy rounds (async_ll_zero_copy, SDMA only): the expert reads the
-    # landing segments, so dispatch's RecvCopy becomes a finalize pass. Level 1
-    # copies the segmented expert output into the compact combine staging and
-    # keeps the rest of combine; level 2 sends it in place.
+    # landing segments, so dispatch's RecvCopy becomes a finalize pass, and the
+    # segmented expert output is sent in place, so combine has no SendCopy.
     _ASYNCLL_ZC_SEQ = {
         "dispatch_send": (
             "dispatch_slotassign",
@@ -1416,20 +1424,13 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             "dispatch_sendtransfer_zc",
         ),
         "dispatch_recv": ("dispatch_recvtransfer", "dispatch_recvfinalize_zc"),
-        "combine_send": ("combine_sendcopy_zc", "combine_sendtransfer"),
-        "combine_recv": ("combine_recvtransfer", "combine_recvcopy"),
-    }
-    _ASYNCLL_ZC_SEQ_IN_PLACE = {
         "combine_send": ("combine_sendtransfer_zc",),
         "combine_recv": ("combine_recvtransfer", "combine_recvcopy_zc"),
     }
 
     @classmethod
-    def _asyncll_zc_seq(cls, level):
-        seq = dict(cls._ASYNCLL_ZC_SEQ)
-        if level == 2:
-            seq.update(cls._ASYNCLL_ZC_SEQ_IN_PLACE)
-        return seq
+    def _asyncll_zc_seq(cls):
+        return dict(cls._ASYNCLL_ZC_SEQ)
 
     @staticmethod
     def _asyncll_options(cfg, arch):
@@ -1513,7 +1514,7 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self._asyncll_mode, _ = self._asyncll_options(cfg, self._arch)
         sequences = self._asyncll_seq(cfg, self._asyncll_mode)
         zc_sequences = (
-            self._asyncll_zc_seq(cfg.async_ll_zero_copy)
+            self._asyncll_zc_seq()
             if cfg.async_ll_zero_copy
             else {}
         )
@@ -1680,19 +1681,17 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
 
     def _zc_combine_input(self, input, stride):
         """The expert output a zero-copy combine sends: world_size * stride rows
-        in the dispatch's segment layout; level 2 sends from the arena view."""
+        in the dispatch's segment layout, sent from the arena view."""
         rows = self.cfg.world_size * stride
         if input.shape[0] != rows:
             raise ValueError(
                 f"a zero-copy combine takes the segmented expert output: "
                 f"{rows} rows (world_size x stride {stride}), got {input.shape[0]}"
             )
-        if self.cfg.async_ll_zero_copy == 2:
-            view = self.combine_in_view()
-            if input.data_ptr() != view.data_ptr():
-                view.copy_(input)
-            return view
-        return input.contiguous()
+        view = self.combine_in_view()
+        if input.data_ptr() != view.data_ptr():
+            view.copy_(input)
+        return view
 
     def zero_copy_error_flags(self, clear=False):
         """Sticky error bits of zero-copy rounds, 0 when none: 1 = a stride below

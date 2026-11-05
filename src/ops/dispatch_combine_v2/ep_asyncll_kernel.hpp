@@ -1366,9 +1366,7 @@ __device__ void EpCombineAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
 // round's data; RecvFinalizeZc points their experts at a non-local one with weight 0, which the
 // expert's mask drops. The expert writes its output in the same layout to inter_dispatch_staging,
 // so what goes back to source s is rows [s * S, s * S + n_s) there. CombineSendTransferZc sends
-// that in place and CombineRecvCopyZc reads the replies at [d * S + slot] of inter_combine_inp;
-// CombineSendCopyZc instead copies it into the compact combine staging and keeps the original
-// combine transfer and RecvCopy.
+// that in place and CombineRecvCopyZc reads the replies at [d * S + slot] of inter_combine_inp.
 //
 // SlotAssign is unchanged: dispDestTokIdMap still encodes SendBufSlotOffset with the capacity
 // stride (and its null sentinel), only the row a slot lives in moves. Peers' rows are staged at
@@ -1660,52 +1658,6 @@ __device__ void EpDispatchAsyncLLRecvFinalizeZc_body(EpDispatchCombineArgs args)
       args.dispatchGridBarrier[0] = 0;
       atomicAdd(args.crossDeviceBarrierFlag, 1ull);
     }
-  }
-}
-
-/* ----------------------------- EpCombineAsyncLLSendCopyZc ------------------------------------- */
-// CombineSendCopy reading the segmented expert output: compact reply t is found by a prefix sum
-// over the segment counts, as RecvCopy finds a source, and goes to the same staging slot the
-// original puts it in, so the original combine transfer and RecvCopy follow unchanged.
-template <EpInterNodeKernelCfg kConfig, typename T>
-__device__ void EpCombineAsyncLLSendCopyZc_body(EpDispatchCombineArgs args) {
-  DEF_COMMON_VARS;
-  static_assert(kConfig.worldSize <= 64,
-                "the per-PE offset prefix sum is one wavefront wide; worldSize must fit it");
-  if constexpr (asyncll::EarlyNotify<kConfig>) {
-    // Same bookkeeping as EpCombineAsyncLLSendCopy_body.
-    if (globalWarpId == 0 && laneId < npes) {
-      uint8_t* recvCounts = args.reg(args.offRecvTokenNum)->template GetAs<uint8_t*>();
-      uint64_t* count = reinterpret_cast<uint64_t*>(recvCounts + asyncll::RecvCountSlot(laneId));
-      uint8_t* sendCounts = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
-      const uint64_t announced = core::AtomicLoadRelaxedSystem(count);
-      *reinterpret_cast<uint64_t*>(sendCounts + asyncll::SendCountSlot(laneId)) =
-          announced == 0 ? 0 : announced - 1;
-      core::AtomicStoreRelaxedSystem(count, uint64_t{0});
-      *reinterpret_cast<uint64_t*>(sendCounts + asyncll::SendFlagSlot(laneId)) =
-          args.crossDeviceBarrierFlag[0];
-    }
-  }
-  const int stride = args.zcStride;
-  int inclusive = (laneId < npes) ? args.zcSegCount[laneId] : 0;
-  for (int offset = 1; offset < npes; offset <<= 1) {
-    const int n = __shfl_up(inclusive, offset);
-    if (laneId >= offset) inclusive += n;
-  }
-  int exclusive = __shfl_up(inclusive, 1);
-  if (laneId == 0) exclusive = 0;
-  const int total = __shfl(inclusive, npes - 1);
-
-  uint8_t* stagingPtr = args.reg(args.offCombineStaging)->template GetAs<uint8_t*>();
-  for (int t = globalWarpId; t < total; t += globalWarpNum) {
-    const unsigned long long owners = __ballot((laneId < npes) && (exclusive <= t));
-    const int srcPe = 63 - __clzll(static_cast<long long>(owners));
-    const int slotId = t - __shfl(exclusive, srcPe);
-    core::WarpCopy<uint8_t, 4>(
-        stagingPtr + static_cast<size_t>(SendBufSlotOffset(config, srcPe, slotId)) * hiddenBytes,
-        static_cast<const uint8_t*>(args.inpTokenBuf) +
-            (static_cast<size_t>(srcPe) * stride + slotId) * hiddenBytes,
-        hiddenBytes);
   }
 }
 
