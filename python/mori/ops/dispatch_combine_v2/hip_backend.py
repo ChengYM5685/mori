@@ -61,7 +61,12 @@ from mori.tensor_utils import from_gpu_ptr
 
 from . import ep_plans as cb
 from .dispatch_combine_op import _PUSH_QUANT_TYPES, EpDispatchCombineOp, KernelSet
-from .internode_regions import asyncll_regions, asyncll_zc_layout, internode_regions
+from .internode_regions import (
+    asyncll_regions,
+    asyncll_zc_error_word,
+    asyncll_zc_layout,
+    internode_regions,
+)
 from .symm_arena import SymmArena
 
 # C++ offset-argument stem -> arena region name. The C++ side names the offsets
@@ -754,11 +759,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         self.disp_receiver_idx_map = (
             torch.zeros(cfg.effective_max_recv, **i32) if cfg.async_ll else None
         )
-        # AsyncLL zero copy only: each source's rows this round, then sticky error
-        # bits (zero_copy_error_flags).
-        self.zc_seg_count = (
-            torch.zeros(world_size + 1, **i32) if cfg.async_ll_zero_copy else None
-        )
         self.total_recv = torch.zeros(1, **i32)
         self.dispatch_barrier = torch.zeros(world_size, dtype=torch.uint32, device=dev)
         self.combine_barrier = torch.zeros(world_size, dtype=torch.uint32, device=dev)
@@ -1209,15 +1209,6 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
             # embed a ccoDevComm by value, so the binding memcpys from host memory.
             devComm=self._dev_comm._dev_comm.host_ptr,
         )
-        if self.cfg.async_ll_zero_copy:
-            # Only bound on zero-copy ops, so an older host library serves the rest.
-            # An empty row points at the next rank's first expert, which the
-            # expert mask of this rank drops.
-            cfg = self.cfg
-            invalid = (cfg.rank + 1) % cfg.world_size * cfg.num_experts_per_rank
-            self._internode_static_cache.update(
-                zcSegCount=ptr(self.zc_seg_count), zcInvalidExpert=invalid
-            )
         return self._internode_static_cache
 
     def _internode_variants(self, phase):
@@ -1697,11 +1688,20 @@ class EpDispatchCombineOpHip(EpDispatchCombineOp, backend="hip"):
         """Sticky error bits of zero-copy rounds, 0 when none: 1 = a stride below
         this rank's rows for some peer (rows were dropped), 2 = a peer's round did
         not use this rank's stride. Reads device memory, so it synchronizes."""
-        if self.zc_seg_count is None:
+        if not self.cfg.async_ll_zero_copy:
             return 0
-        flags = int(self.zc_seg_count[-1].item())
+        word = self._views.get("zc_error")
+        if word is None:
+            word = from_gpu_ptr(
+                self.arena.local_ptr("send_count")
+                + asyncll_zc_error_word(self.cfg.world_size) * 8,
+                (1,),
+                torch.int64,
+            )
+            self._views["zc_error"] = word
+        flags = int(word.item())
         if clear:
-            self.zc_seg_count[-1].zero_()
+            word.zero_()
         return flags
 
     def _build_internode_kernels(self, cfg) -> KernelSet:

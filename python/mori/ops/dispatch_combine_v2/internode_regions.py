@@ -214,13 +214,14 @@ def asyncll_regions(cfg):
     # Zero copy lays the dispatch landing and send staging out per field (see
     # asyncll_zc_layout), lets the expert write its whole segmented output into
     # inter_dispatch_staging, and adds the stride handshake to send_count: one
-    # word per source, written by that source's engine, plus the local source.
+    # word per source, written by that source's engine, the local source word,
+    # and the local sticky error word (asyncll_zc_error_word).
     if getattr(cfg, "async_ll_zero_copy", 0):
         zc_bytes = asyncll_zc_layout(cfg)["bytes"]
         for name in ("inter_staging", "inter_dispatch_inp"):
             regions[name] = max(regions[name], zc_bytes)
         regions["inter_dispatch_staging"] = send_slots * hidden_bytes
-        regions["send_count"] += (world_size + 1) * _U64
+        regions["send_count"] += (world_size + 2) * _U64
 
     # Combine gets its OWN send staging rather than reusing inter_staging.
     #
@@ -243,6 +244,13 @@ def asyncll_regions(cfg):
 
 
 _ZC_ALIGN = 256
+
+
+def asyncll_zc_error_word(world_size):
+    """Index of the zero-copy sticky error word in ``send_count`` (u64 words):
+    after the count/epoch pairs, the per-source stride words and the local stride
+    source word. Must match ``asyncll::ZcErrSlot`` in ep_asyncll_kernel.hpp."""
+    return 3 * world_size + 1
 
 
 def asyncll_zc_layout(cfg):

@@ -172,7 +172,7 @@ class AsyncLLZeroCopyTest(unittest.TestCase):
             if zero_copy:
                 self.assertGreaterEqual(regions["inter_dispatch_inp"], layout["bytes"])
                 self.assertGreaterEqual(regions["inter_staging"], layout["bytes"])
-                self.assertEqual(regions["send_count"], (8 * 2 + 8 + 1) * 8)
+                self.assertEqual(regions["send_count"], (8 * 2 + 8 + 2) * 8)
             else:
                 self.assertEqual(regions["send_count"], 8 * 2 * 8)
 

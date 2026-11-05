@@ -1503,7 +1503,7 @@ class EpDispatchCombineOp:
         # blockFlagCounter, so a reset taken between a dispatch and its combine
         # would leave it advanced and the next dispatch would address slots past
         # its node's slice of the send buffer.
-        for name in ("block_flag_counter", "inter_blocks_barrier", "zc_seg_count"):
+        for name in ("block_flag_counter", "inter_blocks_barrier"):
             counter = getattr(self, name, None)
             if counter is not None:
                 counter.zero_()

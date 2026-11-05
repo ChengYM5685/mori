@@ -1374,7 +1374,8 @@ __device__ void EpCombineAsyncLLRecvCopy_body(EpDispatchCombineArgs args) {
 // written straight into its landing segment.
 namespace asyncll {
 
-// Sticky bits in zcSegCount[worldSize]; the host reads and clears them.
+// Sticky bits in the send_count word at ZcErrSlot; the host reads and clears them
+// (zero_copy_error_flags).
 constexpr int ZcErrOverflow = 1;  // this rank had more rows for a peer than the stride
 constexpr int ZcErrStride = 2;    // a peer's round did not use this rank's stride
 
@@ -1413,6 +1414,17 @@ __device__ __forceinline__ size_t ZcStrideSlot(const EpInterNodeDeviceCfg& confi
 __device__ __forceinline__ size_t ZcStrideSourceSlot(const EpInterNodeDeviceCfg& config) {
   return static_cast<size_t>(config.worldSize) * 3 * sizeof(uint64_t);
 }
+// Local only, never sent. Must match asyncll_zc_error_word() in internode_regions.py.
+__device__ __forceinline__ size_t ZcErrSlot(const EpInterNodeDeviceCfg& config) {
+  return (static_cast<size_t>(config.worldSize) * 3 + 1) * sizeof(uint64_t);
+}
+__device__ __forceinline__ void ZcFlagError(const EpDispatchCombineArgs& args,
+                                            const EpInterNodeDeviceCfg& config,
+                                            unsigned long long bit) {
+  atomicOr(reinterpret_cast<unsigned long long*>(
+               args.reg(args.offSendCount)->template GetAs<uint8_t*>() + ZcErrSlot(config)),
+           bit);
+}
 
 constexpr int kZcFields = 5;  // hidden, index, weight, scale, source token id
 
@@ -1449,10 +1461,10 @@ __device__ __forceinline__ void ZcPostSegment(const ::mori::cco::ccoDevComm& com
 template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchAsyncLLSendCopyZc_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
-  const int stride = args.zcStride;
+  const int stride = static_cast<int>(args.zcStride);
   if (globalWarpId == 0 && laneId < npes) {
     const int raw = core::AtomicLoadRelaxed(args.destPeTokenCounter + laneId);
-    if (raw > stride) atomicOr(args.zcSegCount + npes, asyncll::ZcErrOverflow);
+    if (raw > stride) asyncll::ZcFlagError(args, config, asyncll::ZcErrOverflow);
     uint8_t* words = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
     if constexpr (asyncll::EarlyNotify<kConfig>) {
       *reinterpret_cast<uint64_t*>(words + asyncll::SendCountSlot(laneId)) =
@@ -1529,7 +1541,7 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchAsyncLLSendTransferZc_body(EpDispatchCombineArgs args,
                                                      const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
-  const int stride = args.zcStride;
+  const int stride = static_cast<int>(args.zcStride);
   const asyncll::ZcLayout layout = asyncll::ZcLayoutOf(config, hiddenBytes);
   uint8_t* words = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
 
@@ -1604,7 +1616,7 @@ template <EpInterNodeKernelCfg kConfig, typename T>
 __device__ void EpDispatchAsyncLLRecvFinalizeZc_body(EpDispatchCombineArgs args) {
   DEF_COMMON_VARS;
   static_assert(kConfig.worldSize <= 64, "the segment counts are staged in a 64-entry LDS array");
-  const int stride = args.zcStride;
+  const int stride = static_cast<int>(args.zcStride);
   const uint8_t* recvCounts = args.reg(args.offRecvTokenNum)->template GetAs<const uint8_t*>();
 
   __shared__ int segRows[64];
@@ -1622,6 +1634,8 @@ __device__ void EpDispatchAsyncLLRecvFinalizeZc_body(EpDispatchCombineArgs args)
   const index_t* srcTok = reinterpret_cast<const index_t*>(landing + layout.srcTok);
   index_t* reverse = args.reg(args.offDispTokIdToSrcTokId)->template GetAs<index_t*>();
   const int rows = npes * stride;
+  // The next rank's first expert: this rank's expert mask drops it.
+  const index_t invalidExpert = ((myPe + 1) % npes) * config.numExpertPerRank;
   for (int r = globalThdId; r < rows; r += globalThdNum) {
     const int srcPe = r / stride;
     if (r - srcPe * stride < segRows[srcPe]) {
@@ -1630,7 +1644,7 @@ __device__ void EpDispatchAsyncLLRecvFinalizeZc_body(EpDispatchCombineArgs args)
     }
     reverse[r] = -1;
     for (int k = 0; k < config.numExpertPerToken; ++k) {
-      indices[static_cast<size_t>(r) * config.numExpertPerToken + k] = args.zcInvalidExpert;
+      indices[static_cast<size_t>(r) * config.numExpertPerToken + k] = invalidExpert;
       weights[static_cast<size_t>(r) * config.numExpertPerToken + k] = 0.0f;
     }
   }
@@ -1639,13 +1653,12 @@ __device__ void EpDispatchAsyncLLRecvFinalizeZc_body(EpDispatchCombineArgs args)
     int mine = 0;
     if (laneId < npes) {
       mine = segRows[laneId];
-      args.zcSegCount[laneId] = mine;
       if (laneId != myPe) {
         uint64_t* word =
             reinterpret_cast<uint64_t*>(args.reg(args.offSendCount)->template GetAs<uint8_t*>() +
                                         asyncll::ZcStrideSlot(config, laneId));
         if (core::AtomicLoadRelaxedSystem(word) != static_cast<uint64_t>(stride))
-          atomicOr(args.zcSegCount + npes, asyncll::ZcErrStride);
+          asyncll::ZcFlagError(args, config, asyncll::ZcErrStride);
         // Re-armed before this rank's combine lets the peer start its next round.
         core::AtomicStoreRelaxedSystem(word, uint64_t{0});
       }
@@ -1671,7 +1684,7 @@ __device__ void EpCombineAsyncLLSendTransferZc_body(EpDispatchCombineArgs args,
                                                     const ::mori::cco::ccoDevComm& comm) {
   DEF_COMMON_VARS;
   ::mori::cco::ccoSdma sdma{comm};
-  const int stride = args.zcStride;
+  const int stride = static_cast<int>(args.zcStride);
   uint8_t* recvCounts = args.reg(args.offRecvTokenNum)->template GetAs<uint8_t*>();
   uint8_t* words = args.reg(args.offSendCount)->template GetAs<uint8_t*>();
 
@@ -1742,7 +1755,7 @@ __device__ void EpCombineAsyncLLRecvCopyZc_body(EpDispatchCombineArgs args) {
   T** srcPtrs = reinterpret_cast<T**>(epAsyncLlShared) + warpId * kTopk;
 
   if (args.curRankNumToken == 0) return;
-  const int stride = args.zcStride;
+  const int stride = static_cast<int>(args.zcStride);
   T* peerBase = args.reg(args.offCombineInp)->template GetAs<T*>();
   T* selfBase = args.reg(args.offDispatchStaging)->template GetAs<T*>();
 
