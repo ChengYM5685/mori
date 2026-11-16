@@ -168,6 +168,11 @@ class IonicDeviceContext : public RdmaDeviceContext {
   virtual void ConnectEndpoint(const RdmaEndpointHandle& local, const RdmaEndpointHandle& remote,
                                uint32_t qpn = 0) override;
   static void pd_release(ibv_pd* pd, void* pd_context, void* ptr, uint64_t resource_type);
+  // MORI_IONIC_HOST_RINGS=1: CQ/SQ/RQ rings in pinned host memory (anonymous pages registered
+  // with HIP), for hosts with neither a GPU peer-memory client nor dma-buf ring support.
+  static void* pd_alloc_host(ibv_pd* pd, void* pd_context, size_t size, size_t alignment,
+                             uint64_t resource_type);
+  static void pd_release_host(ibv_pd* pd, void* pd_context, void* ptr, uint64_t resource_type);
   static void* pd_alloc_device_uncached(ibv_pd* pd, void* pd_context, size_t size, size_t alignment,
                                         uint64_t resource_type);
   // Descriptor-ring allocators handing the provider a dmabuf fd instead of a bare VA, so the

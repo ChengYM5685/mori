@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -543,6 +544,80 @@ void* IonicDeviceContext::pd_alloc_device_uncached(struct ibv_pd* pd, void* pd_c
 }
 
 namespace {
+// Host ring CPU VA -> (bytes, GPU VA). hipHostRegister maps the pages into the GPU at a different
+// VA, while libionic hands back (and the kernel pins) the CPU VA, so the GPU-side endpoint handle
+// has to be translated.
+std::mutex gHostRingsMutex;
+std::map<uintptr_t, std::pair<size_t, uintptr_t>> gHostRings;
+
+template <typename T>
+T* HostRingDevPtr(T* p) {
+  std::lock_guard<std::mutex> lock(gHostRingsMutex);
+  if (gHostRings.empty() || p == nullptr) return p;
+  uintptr_t a = reinterpret_cast<uintptr_t>(p);
+  auto it = gHostRings.upper_bound(a);
+  if (it == gHostRings.begin()) return p;
+  --it;
+  if (a >= it->first + it->second.first) return p;
+  return reinterpret_cast<T*>(it->second.second + (a - it->first));
+}
+}  // namespace
+
+// Host-memory rings. Without amdgpu PeerDirect (no peer-memory client registered with ib_core)
+// the kernel cannot pin a GPU VA, so ibv_create_cq/qp on device rings fails with EFAULT; and
+// dma-buf rings need ionic_dv_pd_set_dmabuf_alloc in libionic plus kernel support. Anonymous
+// pages are pinnable by ib_umem_get, and hipHostRegister maps them into the GPU at the same VA
+// (fine-grained), so the GPU-initiated path can still poll CQs and write WQEs.
+void* IonicDeviceContext::pd_alloc_host(struct ibv_pd* pd, void* pd_context, size_t size,
+                                        size_t alignment, uint64_t resource_type) {
+  const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  size_t align = std::max(alignment, page);
+  size_t bytes = (size + page - 1) / page * page;
+  void* ptr = nullptr;
+  if (posix_memalign(&ptr, align, bytes) != 0 || ptr == nullptr) {
+    MORI_APP_ERROR("pd_alloc_host: posix_memalign({}, {}) failed", align, bytes);
+    return nullptr;
+  }
+  memset(ptr, 0, bytes);
+  hipError_t err = hipHostRegister(ptr, bytes, hipHostRegisterMapped | hipHostRegisterPortable);
+  if (err != hipSuccess) {
+    (void)hipGetLastError();
+    MORI_APP_ERROR("pd_alloc_host: hipHostRegister({}, {}) failed: {}", ptr, bytes,
+                   hipGetErrorString(err));
+    free(ptr);
+    return nullptr;
+  }
+  void* devPtr = nullptr;
+  err = hipHostGetDevicePointer(&devPtr, ptr, 0);
+  if (err != hipSuccess || devPtr == nullptr) {
+    (void)hipGetLastError();
+    MORI_APP_ERROR("pd_alloc_host: hipHostGetDevicePointer({}) failed: {}", ptr,
+                   hipGetErrorString(err));
+    (void)hipHostUnregister(ptr);
+    free(ptr);
+    return nullptr;
+  }
+  {
+    std::lock_guard<std::mutex> lock(gHostRingsMutex);
+    gHostRings[reinterpret_cast<uintptr_t>(ptr)] = {bytes, reinterpret_cast<uintptr_t>(devPtr)};
+  }
+  MORI_APP_TRACE("pd_alloc_host, addr:{}, dev:{}, size:{}, align:{}, resource_type:{:#x}", ptr,
+                 devPtr, bytes, align, resource_type);
+  return ptr;
+}
+
+void IonicDeviceContext::pd_release_host(struct ibv_pd* pd, void* pd_context, void* ptr,
+                                         uint64_t resource_type) {
+  if (ptr == nullptr) return;
+  {
+    std::lock_guard<std::mutex> lock(gHostRingsMutex);
+    gHostRings.erase(reinterpret_cast<uintptr_t>(ptr));
+  }
+  if (hipHostUnregister(ptr) != hipSuccess) (void)hipGetLastError();
+  free(ptr);
+}
+
+namespace {
 
 constexpr size_t kDmabufRingAlign = 4096;
 constexpr size_t kDmabufRingChunkBytes = size_t{16} << 20;
@@ -712,7 +787,13 @@ void IonicDeviceContext::create_parent_domain(ibv_context* context, struct ibv_p
   // Same switch as payload MRs: MORI_ENABLE_DMABUF_REG=1 enables dma-buf CQ/SQ/RQ
   // rings. Needs libionic >= the release that exports ionic_dv_pd_set_dmabuf_alloc;
   // older libs keep the bare-VA alloc above.
-  bool wantDmabufRings = env::IsEnvVarEnabled("MORI_ENABLE_DMABUF_REG");
+  bool hostRings = env::IsEnvVarEnabled("MORI_IONIC_HOST_RINGS");
+  if (hostRings) {
+    pattr.alloc = IonicDeviceContext::pd_alloc_host;
+    pattr.free = IonicDeviceContext::pd_release_host;
+    MORI_APP_INFO("MORI_IONIC_HOST_RINGS=1: ionic CQ/SQ/RQ rings in pinned host memory");
+  }
+  bool wantDmabufRings = !hostRings && env::IsEnvVarEnabled("MORI_ENABLE_DMABUF_REG");
   bool haveDmabufAlloc = IonicDvApi::Instance().pd_set_dmabuf_alloc != nullptr;
   bool useDmabufRings = wantDmabufRings && haveDmabufAlloc && ProbeIonicDmabufExport();
   if (wantDmabufRings && !haveDmabufAlloc) {
@@ -811,8 +892,8 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   printf("\n");
 #endif
   endpoint.vendorId = RdmaDeviceVendorId::Pensando;
-  endpoint.wqHandle.sqAddr = qp->GetSqAddress();
-  endpoint.wqHandle.rqAddr = qp->GetRqAddress();
+  endpoint.wqHandle.sqAddr = HostRingDevPtr(qp->GetSqAddress());
+  endpoint.wqHandle.rqAddr = HostRingDevPtr(qp->GetRqAddress());
   endpoint.wqHandle.dbrAddr = qp->gpu_db_sq;
   endpoint.wqHandle.sqWqeNum = qp->sq_mask + 1;  // qp->wqeNum;
   endpoint.wqHandle.rqWqeNum = qp->rq_mask + 1;  // qp->wqeNum;
@@ -822,7 +903,7 @@ RdmaEndpoint IonicDeviceContext::CreateRdmaEndpoint(const RdmaEndpointConfig& co
   endpoint.wqHandle.sq_dbval = qp->sq_dbval;
   endpoint.wqHandle.rq_dbval = qp->rq_dbval;
 
-  endpoint.cqHandle.cqAddr = qp->ionic_cq_buf;
+  endpoint.cqHandle.cqAddr = HostRingDevPtr(qp->ionic_cq_buf);
   endpoint.cqHandle.consIdx = 0;
   endpoint.cqHandle.cqeNum = qp->cq_mask + 1;
   endpoint.cqHandle.cqeSize = GetIonicCqeSize();
